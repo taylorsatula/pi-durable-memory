@@ -1,0 +1,19 @@
+# The live store and its key. Never committed, never published: memory.key decrypts
+# memory.db, and both belong to the operator who is running the extension.
+memory.db
+memory.db-wal
+memory.db-shm
+memory.key
+
+# Benchmark inputs derived from the operator's own pi session history. A fresh clone
+# builds its own with bench/digest.mjs — see bench/README.md.
+bench/corpus.json
+bench/embcache.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editors and OS
+.DS_Store
+*.swp

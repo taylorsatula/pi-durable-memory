@@ -1,0 +1,31 @@
+{
+  "name": "@taylorsatula/pi-durable-memory",
+  "version": "0.1.0",
+  "description": "Encrypted, embedding-searched long-term memory for pi, with a surface/finish attention-sink loop",
+  "keywords": ["pi-package", "pi-extension", "memory", "sqlite", "embeddings", "encryption"],
+  "license": "MIT",
+  "author": "Taylor Satula",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taylorsatula/pi-durable-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/taylorsatula/pi-durable-memory/issues"
+  },
+  "homepage": "https://github.com/taylorsatula/pi-durable-memory#readme",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

@@ -1,0 +1,9 @@
+# The store and its key are the operator's, not the package's.
+memory.db
+memory.db-wal
+memory.db-shm
+memory.key
+
+# Benchmark inputs derived from the operator's own session history.
+bench/corpus.json
+bench/embcache.json
