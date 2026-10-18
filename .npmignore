@@ -7,3 +7,6 @@ memory.key
 # Benchmark inputs derived from the operator's own session history.
 bench/corpus.json
 bench/embcache.json
+
+# Pack artifacts
+*.tgz

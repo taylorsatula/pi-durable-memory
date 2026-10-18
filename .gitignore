@@ -17,3 +17,6 @@ npm-debug.log*
 # Editors and OS
 .DS_Store
 *.swp
+
+# Pack artifacts
+*.tgz

@@ -1,8 +1,15 @@
 {
   "name": "@taylorsatula/pi-durable-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Encrypted, embedding-searched long-term memory for pi, with a surface/finish attention-sink loop",
-  "keywords": ["pi-package", "pi-extension", "memory", "sqlite", "embeddings", "encryption"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "memory",
+    "sqlite",
+    "embeddings",
+    "encryption"
+  ],
   "license": "MIT",
   "author": "Taylor Satula",
   "type": "module",
@@ -21,7 +28,9 @@
     "access": "public"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -11,13 +11,12 @@ not, because encrypted content cannot be searched.
 
 ```
 ├── index.ts        the extension
-├── memory.db       created on first use — the store
-├── memory.key      created on first use, mode 0600 — never published
 └── bench/          the tuning harness and the functional witness
 ```
 
-The database rides beside the extension so the directory is self-contained. See **Installing**
-for the one case where that needs an override.
+The store is not in the package. `memory.db` and `memory.key` are created on first use in
+`~/.pi/agent/durable-memory/`, outside every directory pi reconciles, so they survive
+`pi update`. See **Where the store lives** for why that matters.
 
 ## The loop
 
@@ -37,8 +36,8 @@ Every mutation array supplied on a call is applied regardless of which `op` name
 order delete → edit → create → pointer → helpful. That is deliberate: a model that attaches a
 payload to `finish` still has it stored rather than silently dropped.
 
-`/durable-memory` reports the store size, paths, embedder, credential source, and this
-session's call counts.
+`/durable-memory status` reports the store size, paths, endpoint, credential source, and this
+session's call counts; the bare command opens the settings menu.
 
 ## Triggers are transcript-checkable, not felt
 
@@ -79,21 +78,55 @@ The cap stops a heavily-upvoted memory from ranking on similarity it does not ha
 constants are measured in `bench/`; **they are embedder-specific** and must be re-derived after
 changing models.
 
-## Configuration
+## Settings
 
-| Variable | Default | Purpose |
+Run `/durable-memory` with no arguments for an interactive menu:
+
+```
+Endpoint        remote — https://gw.lunaroute.com/v1/embeddings
+Embedding model emb-qwen3
+Auth key        set (…a1b2, 40 chars)
+Database dir    /Users/you/.pi/agent/durable-memory
+Show status
+Done
+```
+
+- **Endpoint** — `remote` for a hosted OpenAI-compatible endpoint, `local` for a llama.cpp,
+  Ollama or LM Studio server on this machine. Choosing one prompts for the URL, blank keeping
+  the default (`https://gw.lunaroute.com/v1/embeddings` / `http://localhost:8080/v1/embeddings`).
+- **Embedding model** — the model name sent to that endpoint.
+- **Auth key** — bearer token, stored in the settings file at mode 0600. Blank clears it. The
+  dialog is not masked, so the token is visible while you type it.
+- **Database dir** — where `memory.db` and `memory.key` live. A path inside `node_modules` is
+  refused, because an update would delete it.
+
+Every change is written to disk immediately, taking effect on the next tool call with no
+restart. A local endpoint does not require a key: if none is configured, the request is sent
+without an `Authorization` header.
+
+Settings live at `~/.pi/agent/durable-memory/config.json`, mode 0600, at a fixed path so moving
+the database does not move the settings. `/durable-memory status` prints the resolved state
+without opening the menu.
+
+### Environment variables
+
+Env vars win over the settings file, which wins over the defaults. They exist for CI and one-off
+runs; the settings command is the normal path.
+
+| Variable | Overrides | Purpose |
 |---|---|---|
-| `DURABLE_MEMORY_EMBED_URL` | `https://gw.lunaroute.com/v1/embeddings` | Any OpenAI-compatible `/embeddings` |
-| `DURABLE_MEMORY_EMBED_MODEL` | `emb-qwen3` | Changing this invalidates stored vectors |
-| `DURABLE_MEMORY_EMBED_PROVIDER` | `lunaroute` | Which `auth.json` entry to take the credential from |
-| `DURABLE_MEMORY_EMBED_KEY` | unset | Explicit credential; skips `auth.json` |
-| `DURABLE_MEMORY_DIR` | the extension's own directory | Where `memory.db` and `memory.key` live |
+| `DURABLE_MEMORY_EMBED_URL` | endpoint URL | Any OpenAI-compatible `/embeddings` |
+| `DURABLE_MEMORY_EMBED_MODEL` | model | Changing this invalidates stored vectors |
+| `DURABLE_MEMORY_EMBED_KEY` | auth key | Explicit credential; skips the settings file and `auth.json` |
+| `DURABLE_MEMORY_EMBED_PROVIDER` | — | Which `auth.json` entry to read when neither of the above is set |
+| `DURABLE_MEMORY_DIR` | database dir | Where `memory.db` and `memory.key` live. Refused inside `node_modules`. |
 
-Credential chain, first hit wins: `DURABLE_MEMORY_EMBED_KEY`, then `auth.json[provider].key`,
-then `auth.json[provider].access`. The shell-level `LUNAROUTE_API_KEY` is deliberately not
-consulted — pi's lunaroute provider authenticates with OAuth, and a stale shell key would be
-picked up ahead of the working one. A missing credential raises with setup guidance rather than
-falling back.
+The credential chain, first hit wins: `DURABLE_MEMORY_EMBED_KEY`, then the settings file's
+`apiKey`, then `auth.json[provider].key`, then `auth.json[provider].access`. For a `local`
+endpoint an empty chain is fine and the header is omitted; for `remote` a missing credential
+raises with setup guidance rather than falling back. The shell-level `LUNAROUTE_API_KEY` is
+deliberately not consulted — pi's lunaroute provider authenticates with OAuth, and a stale
+shell key would be picked up ahead of the working one.
 
 A changed embedding model does not silently corrupt the store. Vectors of a different dimension
 are skipped and counted, and `surface` tells the model to tell you that those memories need
@@ -101,22 +134,30 @@ re-embedding or deleting.
 
 ## Installing
 
-For a local-path install, nothing to do:
-
 ```bash
-pi install /path/to/durable-memory
+pi install npm:@taylorsatula/pi-durable-memory
 ```
 
-**An npm or git install must set `DURABLE_MEMORY_DIR`.** pi reconciles a remote package on
-`pi update --extensions`, which can rewrite the package directory and take `memory.db` with it.
-Point the store somewhere stable:
-
-```bash
-export DURABLE_MEMORY_DIR="$HOME/.pi/agent/durable-memory"
-```
+No configuration. The store is created on first use in `~/.pi/agent/durable-memory/`, which
+follows `PI_CODING_AGENT_DIR` if you have set it.
 
 `memory.db`, `memory.key`, and the harvested benchmark corpus are excluded from publication, so
-a published package ships code only and starts empty.
+the package ships code only and every install starts empty.
+
+### Where the store lives, and why
+
+The store is deliberately kept outside the package directory. `pi update --extensions` replaces
+an npm package wholesale: a version bump re-extracts the tarball over the old directory. A store
+kept beside `index.ts` is therefore deleted on the first update.
+
+That is measured, not assumed. Upgrading a scratch install from `0.1.0` to `0.1.1` deleted both
+`memory.db` and `memory.key`. A git-source install is worse — pi runs `git clean -fdx`, whose
+`-x` removes gitignored files, which is exactly what the store and key are. A same-version
+reinstall is a no-op and preserves them, which is why the loss is easy to miss: it only happens
+when the version actually changes.
+
+So the default sits in pi's config directory, and an override pointing inside `node_modules`
+is refused at load with an error naming the problem rather than failing silently later.
 
 ## Measured behavior
 
@@ -161,11 +202,11 @@ node bench/run.mjs     # retrieval benchmark and constant sweep
 
 `probe.mjs` loads the real extension through jiti and drives it end to end: registration, the
 system-prompt injection, ciphertext at rest, session stamping, batching, cascade deletes,
-failure paths, keyfile permissions, retrieval accuracy over the harvested corpus, and the
-`DURABLE_MEMORY_DIR` override. It copies `index.ts` to a scratch directory and loads it from
-there, so the store resolves into the scratch directory and the operator's real `memory.db` is
-never touched — no test hook in production code. Nothing about the extension is mocked: real
-AES-256-GCM, real `node:sqlite`, real HTTP to the embedding gateway.
+failure paths, keyfile permissions, retrieval accuracy over the harvested corpus, the store
+location and its `node_modules` refusal. It points `DURABLE_MEMORY_DIR` at a scratch path before
+loading, so the operator's real `memory.db` is never touched — no test hook in production code.
+Nothing about the extension is mocked: real AES-256-GCM, real `node:sqlite`, real HTTP to the
+embedding gateway.
 
 ## Known limits
 

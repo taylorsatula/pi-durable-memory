@@ -51,10 +51,15 @@ const check = (name, cond, extra = "") => {
 const section = (t) => console.log(`\n${t}`);
 
 // ── Load the extension from a scratch copy ───────────────────────────
+// The default store lives in the agent directory, so every load in this probe must point
+// DURABLE_MEMORY_DIR at a scratch path first: otherwise the probe would write into, and
+// delete from, the operator's real store.
 fs.rmSync(SCRATCH, { recursive: true, force: true });
 fs.mkdirSync(SCRATCH, { recursive: true });
 const SRC = path.join(SCRATCH, "index.ts");
 fs.copyFileSync(path.join(PKG, "index.ts"), SRC);
+const PROBE_STORE = path.join(SCRATCH, "store");
+process.env.DURABLE_MEMORY_DIR = PROBE_STORE;
 
 const jiti = createJiti(import.meta.url, {
 	interopDefault: true,
@@ -65,8 +70,8 @@ const jiti = createJiti(import.meta.url, {
 });
 const mod = await jiti.import(SRC);
 
-const DB = path.join(SCRATCH, "memory.db");
-const KEY = path.join(SCRATCH, "memory.key");
+const DB = path.join(PROBE_STORE, "memory.db");
+const KEY = path.join(PROBE_STORE, "memory.key");
 
 // ── Harness ──────────────────────────────────────────────────────────
 const captured = { tools: new Map(), commands: new Map(), handlers: new Map() };
@@ -322,7 +327,7 @@ fs.writeFileSync(KEY, Buffer.concat([keyBytes, Buffer.from([0])]));
 const { MemoryStore } = mod;
 let badKey = false;
 try {
-	new MemoryStore();
+	new MemoryStore(mod.storePathsOf(mod.loadConfig()));
 } catch (e) {
 	badKey = /expected 32/.test(e.message);
 }
@@ -331,10 +336,10 @@ fs.writeFileSync(KEY, keyBytes);
 
 // ── 10. operator command and lifecycle ───────────────────────────────
 section("[10] operator command and lifecycle");
-await captured.commands.get("durable-memory").handler("", ctx);
+await captured.commands.get("durable-memory").handler("status", ctx);
 const status = notices[notices.length - 1]?.text ?? "";
 check("status reports a memory count", /memories:\s+\d+/.test(status), status);
-check("status reports the embedder", /emb-qwen3/.test(status), status);
+check("status reports the endpoint and model", /endpoint:.*emb-qwen3/.test(status), status);
 check("status reports the credential source", /auth\.json:lunaroute|DURABLE_MEMORY_EMBED_KEY/.test(status), status);
 check("status reports the active session", status.includes(SESSION), status);
 check("status reports surface and finish call counts", /surface call\(s\)/.test(status) && /finish call\(s\)/.test(status), status);
@@ -351,21 +356,115 @@ try {
 }
 check("the store reopens lazily after shutdown, as a reload requires", reopened);
 
-section("[11] DURABLE_MEMORY_DIR override");
-const SCRATCH2 = path.join(os.tmpdir(), "durable-memory-probe-alt");
-const ALT_STORE = path.join(os.tmpdir(), "durable-memory-probe-store");
-for (const d of [SCRATCH2, ALT_STORE]) {
-	fs.rmSync(d, { recursive: true, force: true });
-	fs.mkdirSync(d, { recursive: true });
-}
-fs.copyFileSync(path.join(PKG, "index.ts"), path.join(SCRATCH2, "index.ts"));
-process.env.DURABLE_MEMORY_DIR = ALT_STORE;
-const mod2 = await jiti.import(path.join(SCRATCH2, "index.ts"));
-check("DB_PATH follows the override", mod2.DB_PATH === path.join(ALT_STORE, "memory.db"), mod2.DB_PATH);
-check("KEY_PATH follows the override", mod2.KEY_PATH === path.join(ALT_STORE, "memory.key"), mod2.KEY_PATH);
-check("EXT_DIR is still the extension's own directory", mod2.EXT_DIR === SCRATCH2, mod2.EXT_DIR);
+section("[11] store location: a stable path, never inside the package");
+check("the default store is in pi's config directory, not the package", mod.DEFAULT_STORE_DIR === path.join(os.homedir(), ".pi", "agent", "durable-memory") || Boolean(process.env.PI_CODING_AGENT_DIR), mod.DEFAULT_STORE_DIR);
+check("the default is not under the extension directory", !mod.DEFAULT_STORE_DIR.startsWith(PKG), mod.DEFAULT_STORE_DIR);
+check("an override redirects the store", mod.storePathsOf(mod.loadConfig()).db === DB, mod.storePathsOf(mod.loadConfig()).db);
+check("the store directory was created with mode 0700", (fs.statSync(PROBE_STORE).mode & 0o777) === 0o700, (fs.statSync(PROBE_STORE).mode & 0o777).toString(8));
+check("settings live at a fixed path, not inside the movable store", mod.CONFIG_PATH === path.join(mod.DEFAULT_STORE_DIR, "config.json"), mod.CONFIG_PATH);
+
+section("[12] settings file drives endpoint, key, and directory");
+check("no settings file yet", mod.loadConfig().endpoint === undefined);
+const CONFIG = mod.CONFIG_PATH;
+fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
+const ALT_DIR = path.join(SCRATCH, "alt-store");
+fs.writeFileSync(
+	CONFIG,
+	JSON.stringify({ endpoint: "local", url: "http://127.0.0.1:9999/v1/embeddings", model: "local-emb", apiKey: "cfg-secret", storeDir: ALT_DIR }),
+	{ mode: 0o600 },
+);
+check("settings file is mode 0600", (fs.statSync(CONFIG).mode & 0o777) === 0o600, (fs.statSync(CONFIG).mode & 0o777).toString(8));
+const loaded = mod.loadConfig();
+check("endpoint is read", loaded.endpoint === "local");
+
+// Precedence: env beats the file, which beats the defaults.
+process.env.DURABLE_MEMORY_DIR = PROBE_STORE;
+check("DURABLE_MEMORY_DIR beats the config file", mod.storePathsOf(loaded).dir === PROBE_STORE, mod.storePathsOf(loaded).dir);
 delete process.env.DURABLE_MEMORY_DIR;
-check("the default store is beside the extension", mod.DB_PATH === path.join(SCRATCH, "memory.db"), mod.DB_PATH);
+check("storeDir is read from the file", mod.storePathsOf(loaded).dir === ALT_DIR, mod.storePathsOf(loaded).dir);
+check("the store reopens at the configured directory", mod.storePathsOf(loaded).db === path.join(ALT_DIR, "memory.db"));
+check("config storeDir beats the default", mod.storePathsOf(loaded).dir === ALT_DIR);
+process.env.DURABLE_MEMORY_DIR = PROBE_STORE;
+check("DURABLE_MEMORY_DIR beats the config file", mod.storePathsOf(loaded).dir === PROBE_STORE, mod.storePathsOf(loaded).dir);
+delete process.env.DURABLE_MEMORY_DIR;
+
+// A malformed settings file must fail loudly rather than silently reverting.
+fs.writeFileSync(CONFIG, "{ not json", { mode: 0o600 });
+let badJson = false;
+try {
+	mod.loadConfig();
+} catch (e) {
+	badJson = /not valid JSON/.test(e.message);
+}
+check("a malformed settings file fails loudly", badJson);
+fs.writeFileSync(CONFIG, JSON.stringify({ storeDir: path.join(SCRATCH, "node_modules", "x") }), { mode: 0o600 });
+let badDir = false;
+try {
+	mod.storePathsOf(mod.loadConfig());
+} catch (e) {
+	badDir = /node_modules/.test(e.message) && /would delete the store/.test(e.message);
+}
+check("a stored directory inside node_modules is refused", badDir);
+fs.rmSync(CONFIG, { force: true });
+
+section("[13] settings command");
+const NOTICES = [];
+const settingsCtx = {
+	hasUI: true,
+	cwd: process.cwd(),
+	ui: {
+		notify: (text) => NOTICES.push(text),
+		select: async (_t, options) => options[options.length - 1], // pick "Done"
+		input: async () => undefined,
+	},
+	sessionManager: { getSessionId: () => SESSION },
+};
+await captured.commands.get("durable-memory").handler("status", settingsCtx);
+check("status reports the settings file path", /settings:/.test(NOTICES[NOTICES.length - 1] ?? ""), NOTICES[NOTICES.length - 1]);
+await captured.commands.get("durable-memory").handler("status", settingsCtx);
+const st = NOTICES[NOTICES.length - 1] ?? "";
+check("status reports the endpoint", /endpoint:/.test(st), st);
+check("status reports the credential source", /credential:/.test(st), st);
+
+// Choosing the endpoint writes the file, and the store picks it up with no restart.
+const editCtx = {
+	...settingsCtx,
+	ui: {
+		...settingsCtx.ui,
+		select: (() => {
+			let call = 0;
+			return async (_t, options) => {
+				call++;
+				if (call === 1) return options[0]; // "Endpoint"
+				if (call === 2) return options[1]; // "local"
+				return options[options.length - 1]; // "Done"
+			};
+		})(),
+		input: async () => "http://127.0.0.1:1234/v1/embeddings",
+	},
+};
+await captured.commands.get("durable-memory").handler("", editCtx);
+const after = mod.loadConfig();
+check("choosing local writes endpoint=local", after.endpoint === "local", JSON.stringify(after));
+check("the URL entered is stored", after.url === "http://127.0.0.1:1234/v1/embeddings", String(after.url));
+check("the settings file was created 0600", (fs.statSync(CONFIG).mode & 0o777) === 0o600);
+fs.rmSync(CONFIG, { force: true });
+
+section("[14] refuses a store inside node_modules");
+const SCRATCH3 = path.join(os.tmpdir(), "durable-memory-probe-third");
+fs.rmSync(SCRATCH3, { recursive: true, force: true });
+fs.mkdirSync(SCRATCH3, { recursive: true });
+fs.copyFileSync(path.join(PKG, "index.ts"), path.join(SCRATCH3, "index.ts"));
+const goodDir = process.env.DURABLE_MEMORY_DIR;
+process.env.DURABLE_MEMORY_DIR = path.join(SCRATCH3, "node_modules", "some-package");
+let refused = false;
+try {
+	await call({ op: "surface", query: "a query that should never reach the network" });
+} catch (e) {
+	refused = /node_modules/.test(e.message) && /would delete the store/.test(e.message);
+}
+check("a store path under node_modules makes the tool fail loudly", refused);
+process.env.DURABLE_MEMORY_DIR = goodDir;
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);
