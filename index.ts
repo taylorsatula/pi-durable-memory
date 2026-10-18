@@ -33,92 +33,100 @@ import type {
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
-// ── Paths and settings ───────────────────────────────────────────────
+// ── Settings ──────────────────────────────────────────────────────
 
 /** `PI_CODING_AGENT_DIR` is pi's documented override for the config directory. */
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent");
 
 /**
- * The store never lives inside the package.
- *
- * `pi update --extensions` replaces an npm package directory wholesale — a version bump
- * re-extracts the tarball over it — so a store kept beside this file is deleted on the first
- * update. Verified by upgrading a scratch install: memory.db and memory.key both vanished. The
- * default therefore sits in pi's config directory, outside every directory pi reconciles, and
- * survives updates and reinstalls.
+ * The store never lives inside the package. `pi update --extensions` replaces an npm package
+ * directory wholesale, so a store beside index.ts is deleted on the first version bump — a
+ * scratch upgrade took memory.db and memory.key with it. This default sits outside everything
+ * pi reconciles, so updates and reinstalls leave it alone.
  */
 const DEFAULT_STORE_DIR = path.join(AGENT_DIR, "durable-memory");
 
-/** Fixed home for settings. It must not move when the store directory moves. */
+/** Fixed, so that moving the store does not move the settings. */
 const CONFIG_PATH = path.join(DEFAULT_STORE_DIR, "config.json");
 
-const AUTH_PATH = path.join(AGENT_DIR, "auth.json");
+const URLS = {
+	remote: "https://gw.lunaroute.com/v1/embeddings",
+	local: "http://localhost:8080/v1/embeddings",
+};
+type Endpoint = keyof typeof URLS;
 
-const DEFAULT_EMBED_MODEL = "emb-qwen3";
-const REMOTE_EMBED_URL = "https://gw.lunaroute.com/v1/embeddings";
-const LOCAL_EMBED_URL = "http://localhost:8080/v1/embeddings";
-const DEFAULT_EMBED_PROVIDER = "lunaroute";
+/** The fields the settings menu edits. `url` is deliberately not one: it follows `endpoint`. */
+type Key = "endpoint" | "model" | "apiKey" | "storeDir";
 
-interface DurableConfig {
-	/** "remote" sends embeddings to a hosted OpenAI-compatible endpoint; "local" to a llama.cpp,
-	 *  Ollama or LM Studio server on this machine. */
-	endpoint?: "remote" | "local";
-	/** Overrides the URL implied by `endpoint`. */
+interface Settings {
+	endpoint?: Endpoint;
 	url?: string;
 	model?: string;
-	/** Bearer token for the endpoint. Stored mode 0600, alongside this file's other secrets. */
 	apiKey?: string;
-	/** Where memory.db and memory.key live. */
 	storeDir?: string;
 }
 
-function loadConfig(): DurableConfig {
+function readSettings(): Settings {
 	if (!fs.existsSync(CONFIG_PATH)) return {};
-	const raw = fs.readFileSync(CONFIG_PATH, "utf8");
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(raw);
+		parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 	} catch {
-		throw new Error(`${CONFIG_PATH} is not valid JSON. Fix it or delete it to start from defaults.`);
+		throw new Error(`${CONFIG_PATH} is not valid JSON. Fix it or delete it to restore the defaults.`);
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 		throw new Error(`${CONFIG_PATH} must contain a JSON object.`);
 	}
-	return parsed as DurableConfig;
+	return parsed as Settings;
 }
 
-function saveConfig(config: DurableConfig): void {
-	fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-	fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+function writeSettings(settings: Settings): void {
+	fs.mkdirSync(DEFAULT_STORE_DIR, { recursive: true, mode: 0o700 });
+	fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
 	fs.chmodSync(CONFIG_PATH, 0o600);
 }
 
-/**
- * Env vars win over the settings file, then the field defaults. Env remains the escape hatch for
- * CI and one-off runs; the file is what the settings command writes.
- */
-function storeDirOf(config: DurableConfig): string {
-	const dir = process.env.DURABLE_MEMORY_DIR ?? config.storeDir ?? DEFAULT_STORE_DIR;
-	// A store inside node_modules is a store a package manager will delete. Refuse rather than
-	// let a stored setting reintroduce the hazard the default exists to remove.
+/** A store inside node_modules is one a package manager will delete. */
+function assertStoreDir(dir: string): string {
 	if (dir.split(path.sep).includes("node_modules")) {
 		throw new Error(
-			`The store directory points inside node_modules (${dir}). A package update would delete the store. ` +
-				`Choose a stable directory outside any installed package, such as ${DEFAULT_STORE_DIR}.`,
+			`${dir} is inside node_modules, where a package update would delete the store. ` +
+				`Choose a directory outside any installed package, or use the default ${DEFAULT_STORE_DIR}.`,
 		);
 	}
 	return dir;
 }
 
-export interface StorePaths {
-	dir: string;
-	db: string;
-	key: string;
-}
+/**
+ * One resolver, three layers: env (the per-run escape hatch) over the settings file over the
+ * built-in default.
+ */
+function resolveSettings() {
+	const s = readSettings();
+	const endpoint = s.endpoint ?? "remote";
+	const fromEnv = process.env.DURABLE_MEMORY_EMBED_KEY;
 
-function storePathsOf(config: DurableConfig): StorePaths {
-	const dir = storeDirOf(config);
-	return { dir, db: path.join(dir, "memory.db"), key: path.join(dir, "memory.key") };
+	// auth.json is pi's own credential store: a user already signed in to lunaroute needs no setup.
+	let fromAuth: string | undefined;
+	try {
+		const entry = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, "auth.json"), "utf8"))[
+			process.env.DURABLE_MEMORY_EMBED_PROVIDER ?? "lunaroute"
+		];
+		fromAuth = entry?.key ?? entry?.access;
+	} catch {
+		fromAuth = undefined;
+	}
+
+	const apiKey = fromEnv ?? s.apiKey ?? fromAuth;
+	const keySource = fromEnv ? "env" : s.apiKey ? "settings" : fromAuth ? "auth.json" : "none";
+	return {
+		endpoint,
+		url: process.env.DURABLE_MEMORY_EMBED_URL ?? s.url ?? URLS[endpoint],
+		model: process.env.DURABLE_MEMORY_EMBED_MODEL ?? s.model ?? "emb-qwen3",
+		apiKey,
+		keySource,
+		storeDir: assertStoreDir(process.env.DURABLE_MEMORY_DIR ?? s.storeDir ?? DEFAULT_STORE_DIR),
+	};
 }
 
 // ── Tuning ───────────────────────────────────────────────────────────
@@ -232,60 +240,20 @@ function loadKey(keyPath: string): Buffer {
 
 // ── Embeddings ───────────────────────────────────────────────────────
 
-interface EmbedConfig {
-	url: string;
-	model: string;
-	key: string;
-	keySource: string;
-}
-
-/**
- * Credential and endpoint lookup. Precedence, first hit wins:
- *
- *   url/model:  env  >  settings file  >  endpoint implied by settings  >  defaults
- *   key:        env DURABLE_MEMORY_EMBED_KEY  >  settings file apiKey  >  auth.json[provider]
- *
- * The shell-level LUNAROUTE_API_KEY is deliberately not consulted: pi's lunaroute provider
- * authenticates with OAuth, and a stale shell key would be picked up ahead of the working one.
- */
-function resolveEmbedConfig(config: DurableConfig): EmbedConfig {
-	const endpoint = config.endpoint ?? "remote";
-	const url =
-		process.env.DURABLE_MEMORY_EMBED_URL ?? config.url ?? (endpoint === "local" ? LOCAL_EMBED_URL : REMOTE_EMBED_URL);
-	const model = process.env.DURABLE_MEMORY_EMBED_MODEL ?? config.model ?? DEFAULT_EMBED_MODEL;
-	const provider = process.env.DURABLE_MEMORY_EMBED_PROVIDER ?? DEFAULT_EMBED_PROVIDER;
-
-	const fromEnv = process.env.DURABLE_MEMORY_EMBED_KEY;
-	if (fromEnv) return { url, model, key: fromEnv, keySource: "DURABLE_MEMORY_EMBED_KEY" };
-	if (config.apiKey) return { url, model, key: config.apiKey, keySource: CONFIG_PATH };
-
-	// A local endpoint often needs no credential at all; only fall through to auth.json when it
-	// holds the provider entry, so a local server does not fail demanding a cloud token.
-	let entry: Record<string, unknown> | undefined;
-	try {
-		entry = JSON.parse(fs.readFileSync(AUTH_PATH, "utf8"))[provider];
-	} catch {
-		entry = undefined;
-	}
-	const key = (entry?.key ?? entry?.access) as string | undefined;
-	if (key) return { url, model, key, keySource: `auth.json:${provider}` };
-
-	if (endpoint === "local") return { url, model, key: "", keySource: "none (local endpoint)" };
-
-	throw new Error(
-		`No embedding credential. Run /durable-memory to set an auth key, or set DURABLE_MEMORY_EMBED_KEY, ` +
-			`or add a \`${provider}\` entry to ${AUTH_PATH} (run pi once against that provider to complete its auth flow).`,
-	);
-}
-
 /** OpenAI-compatible /embeddings. Throws on any non-2xx or malformed response — no silent zeros. */
 async function embed(texts: string[]): Promise<Float32Array[]> {
 	if (texts.length === 0) return [];
-	// Read settings per call so a change made by the settings command takes effect immediately.
-	const cfg = resolveEmbedConfig(loadConfig());
+	// Resolved per call, so a settings change takes effect on the next tool call with no restart.
+	const cfg = resolveSettings();
+	if (!cfg.apiKey && cfg.endpoint !== "local") {
+		throw new Error(
+			`No embedding credential for ${cfg.url}. Run /durable-memory to set an auth key, or set ` +
+				`DURABLE_MEMORY_EMBED_KEY, or switch the endpoint to local.`,
+		);
+	}
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
-	if (cfg.key) headers.authorization = `Bearer ${cfg.key}`;
+	if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
 	const res = await fetch(cfg.url, {
 		method: "POST",
 		headers,
@@ -378,12 +346,12 @@ interface SurfaceHit {
 export class MemoryStore {
 	private db: DatabaseSync;
 	private key: Buffer;
-	readonly paths: StorePaths;
+	readonly dir: string;
 
-	constructor(paths: StorePaths) {
-		this.paths = paths;
-		this.key = loadKey(paths.key);
-		this.db = new DatabaseSync(paths.db);
+	constructor(dir: string) {
+		this.dir = dir;
+		this.key = loadKey(path.join(dir, "memory.key"));
+		this.db = new DatabaseSync(path.join(dir, "memory.db"));
 		this.db.exec(`
 			PRAGMA journal_mode = WAL;
 			PRAGMA busy_timeout = 5000;
@@ -453,7 +421,7 @@ export class MemoryStore {
 			insert.run(id, encrypt(this.key, clean[i]), toBlob(vectors[i]), vectors[i].length, JSON.stringify([sessionId]), now, now);
 			created.push({ id, text: clean[i] });
 		}
-		this.setEmbedder(resolveEmbedConfig(loadConfig()).model);
+		this.setEmbedder(resolveSettings().model);
 		return created;
 	}
 
@@ -833,12 +801,12 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	 * takes effect without a restart.
 	 */
 	const openStore = (): MemoryStore => {
-		const paths = storePathsOf(loadConfig());
-		if (store && store.paths.dir !== paths.dir) {
+		const { storeDir } = resolveSettings();
+		if (store && store.dir !== storeDir) {
 			store.close();
 			store = undefined;
 		}
-		if (!store) store = new MemoryStore(paths);
+		store ??= new MemoryStore(storeDir);
 		return store;
 	};
 
@@ -932,120 +900,76 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 	const statusText = (ctx: { sessionManager: { getSessionId(): string } }): string => {
 		try {
-			const config = loadConfig();
-			const paths = storePathsOf(config);
+			const r = resolveSettings();
 			const db = openStore();
-			const cfg = resolveEmbedConfig(config);
 			return [
-				`memories:      ${db.count()}`,
-				`db:            ${paths.db}`,
-				`key:           ${paths.key}`,
-				`settings:      ${CONFIG_PATH}`,
-				`endpoint:      ${config.endpoint ?? "remote"} · ${cfg.model} @ ${cfg.url}`,
-				`credential:    ${cfg.keySource}`,
-				`stored vectors from: ${db.embedder() ?? "(none written yet)"}`,
-				`session:       ${ctx.sessionManager.getSessionId()}`,
-				`this session:  ${surfaceCalls} surface call(s), ${finishCalls} finish call(s), ${surfacedThisSession.size} distinct memories shown`,
+				`memories:  ${db.count()}`,
+				`store:     ${db.dir}`,
+				`settings:  ${CONFIG_PATH}`,
+				`endpoint:  ${r.endpoint} · ${r.model} @ ${r.url}`,
+				`auth key:  ${r.keySource}`,
+				`vectors:   ${db.embedder() ?? "none written yet"}`,
+				`session:   ${ctx.sessionManager.getSessionId()}`,
+				`this session: ${surfaceCalls} surface, ${finishCalls} finish, ${surfacedThisSession.size} memories shown`,
 			].join("\n");
 		} catch (err) {
 			return `durable memory unavailable: ${(err as Error).message}`;
 		}
 	};
 
-	const maskKey = (key: string | undefined): string =>
-		!key ? "not set" : `set (…${key.slice(-4)}, ${key.length} chars)`;
-
-	/** Interactive settings loop. Each edit is written to disk immediately, so an abandoned menu keeps what was done. */
+	/**
+	 * Settings menu. Each edit writes immediately, so abandoning the menu keeps what was done; the
+	 * redrawn rows are the confirmation, which is why no branch announces itself.
+	 */
 	const runSettings = async (ctx: ExtensionCommandContext): Promise<void> => {
 		for (;;) {
-			const config = loadConfig();
-			let paths: StorePaths;
-			try {
-				paths = storePathsOf(config);
-			} catch (err) {
-				// A bad stored directory must be fixable from here, not fatal.
-				ctx.ui.notify((err as Error).message, "error");
-				paths = { dir: "(invalid)", db: "", key: "" };
-			}
-			const endpoint = config.endpoint ?? "remote";
-			const options = [
-				`Endpoint      ${endpoint} — ${config.url ?? (endpoint === "local" ? LOCAL_EMBED_URL : REMOTE_EMBED_URL)}`,
-				`Embedding model  ${config.model ?? DEFAULT_EMBED_MODEL}`,
-				`Auth key      ${maskKey(config.apiKey)}`,
-				`Database dir  ${paths.dir}`,
-				`Show status`,
-				`Done`,
+			const s = readSettings();
+			const r = resolveSettings();
+			const rows: Array<[Key | "status" | "done", string]> = [
+				["endpoint", `Endpoint        ${r.endpoint} — ${r.url}`],
+				["model", `Embedding model ${r.model}`],
+				["apiKey", `Auth key        ${r.apiKey ? `set (…${r.apiKey.slice(-4)})` : "not set"}`],
+				["storeDir", `Database dir    ${r.storeDir}`],
+				["status", "Show status"],
+				["done", "Done"],
 			];
-			const choice = await ctx.ui.select("Durable memory settings", options);
-			if (!choice || choice === "Done") return;
+			const picked = await ctx.ui.select("Durable memory", rows.map(([, label]) => label));
+			const key = rows.find(([, label]) => label === picked)?.[0];
+			if (!key || key === "done") return;
+			if (key === "status") {
+				ctx.ui.notify(statusText(ctx), "info");
+				continue;
+			}
 
-			if (choice.startsWith("Endpoint")) {
-				const picked = await ctx.ui.select("Where do embeddings run?", [
-					`remote — hosted endpoint (${REMOTE_EMBED_URL})`,
-					`local — server on this machine (${LOCAL_EMBED_URL})`,
+			if (key === "endpoint") {
+				const chosen = await ctx.ui.select("Embeddings run on", [
+					`remote — hosted (${URLS.remote})`,
+					`local — this machine (${URLS.local})`,
 				]);
-				if (!picked) continue;
-				const nextEndpoint = picked.startsWith("local") ? "local" : "remote";
-				const defaultUrl = nextEndpoint === "local" ? LOCAL_EMBED_URL : REMOTE_EMBED_URL;
-				const url = await ctx.ui.input("Endpoint URL (blank keeps the default)", config.url ?? defaultUrl);
-				config.endpoint = nextEndpoint;
-				config.url = url?.trim() || undefined;
-				saveConfig(config);
-				ctx.ui.notify(`endpoint: ${nextEndpoint} · ${config.url ?? defaultUrl}`, "info");
+				if (!chosen) continue;
+				// A URL typed for the old endpoint would silently override the new one, so clear it.
+				writeSettings({ ...s, endpoint: chosen.startsWith("local") ? "local" : "remote", url: undefined });
 				continue;
 			}
 
-			if (choice.startsWith("Embedding model")) {
-				const model = await ctx.ui.input(
-					"Embedding model (changing this makes stored vectors incomparable)",
-					config.model ?? DEFAULT_EMBED_MODEL,
-				);
-				if (model === undefined) continue;
-				config.model = model.trim() || undefined;
-				saveConfig(config);
-				ctx.ui.notify(`model: ${config.model ?? DEFAULT_EMBED_MODEL}`, "info");
-				continue;
-			}
-
-			if (choice.startsWith("Auth key")) {
-				// Not masked by pi's input dialog: the value is on screen while typed.
-				const key = await ctx.ui.input("Bearer token for the endpoint (blank clears it)", "paste the token");
-				if (key === undefined) continue;
-				config.apiKey = key.trim() || undefined;
-				saveConfig(config);
-				ctx.ui.notify(config.apiKey ? `auth key ${maskKey(config.apiKey)}` : "auth key cleared", "info");
-				continue;
-			}
-
-			if (choice.startsWith("Database dir")) {
-				const dir = await ctx.ui.input("Directory for memory.db and memory.key (blank restores the default)", paths.dir);
-				if (dir === undefined) continue;
-				const wanted = dir.trim();
-				if (!wanted) {
-					config.storeDir = undefined;
-					saveConfig(config);
-					ctx.ui.notify(`database dir: ${DEFAULT_STORE_DIR}`, "info");
-					continue;
-				}
-				// Validate before saving: refuse a directory a package update would delete.
+			if (key === "storeDir") {
+				const typed = await ctx.ui.input("Database directory (blank restores the default)", r.storeDir);
+				if (typed === undefined) continue;
+				const dir = typed.trim();
 				try {
-					storeDirOf({ ...config, storeDir: path.resolve(wanted) });
+					if (dir) assertStoreDir(path.resolve(dir));
 				} catch (err) {
 					ctx.ui.notify((err as Error).message, "error");
 					continue;
 				}
-				config.storeDir = path.resolve(wanted);
-				saveConfig(config);
-				try {
-					fs.mkdirSync(config.storeDir, { recursive: true, mode: 0o700 });
-				} catch (err) {
-					ctx.ui.notify(`cannot create ${config.storeDir}: ${(err as Error).message}`, "error");
-				}
-				ctx.ui.notify(`database dir: ${config.storeDir}`, "info");
+				writeSettings({ ...s, storeDir: dir ? path.resolve(dir) : undefined });
 				continue;
 			}
 
-			if (choice === "Show status") ctx.ui.notify(statusText(ctx), "info");
+			// model and apiKey are both a string that blanks back to the default.
+			const label = key === "apiKey" ? "Auth key for the endpoint (blank clears it)" : "Embedding model";
+			const typed = await ctx.ui.input(label, String(s[key] ?? ""));
+			if (typed !== undefined) writeSettings({ ...s, [key]: typed.trim() || undefined });
 		}
 	};
 
@@ -1073,5 +997,5 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	});
 }
 
-export { DEFAULT_STORE_DIR, CONFIG_PATH, AGENT_DIR, FINISH_MESSAGE, TOP_K, MIN_COSINE, storePathsOf, loadConfig };
-export type { DurableConfig, SurfaceHit, MutationReport, ToolDetails };
+export { DEFAULT_STORE_DIR, CONFIG_PATH, AGENT_DIR, FINISH_MESSAGE, TOP_K, MIN_COSINE, resolveSettings, readSettings };
+export type { Settings, SurfaceHit, MutationReport, ToolDetails };

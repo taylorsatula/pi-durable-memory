@@ -91,9 +91,10 @@ Show status
 Done
 ```
 
-- **Endpoint** — `remote` for a hosted OpenAI-compatible endpoint, `local` for a llama.cpp,
-  Ollama or LM Studio server on this machine. Choosing one prompts for the URL, blank keeping
-  the default (`https://gw.lunaroute.com/v1/embeddings` / `http://localhost:8080/v1/embeddings`).
+- **Endpoint** — `remote` for a hosted OpenAI-compatible endpoint
+  (`https://gw.lunaroute.com/v1/embeddings`), `local` for a llama.cpp, Ollama or LM Studio
+  server on this machine (`http://localhost:8080/v1/embeddings`). The choice sets the URL; for
+  a non-default URL set `DURABLE_MEMORY_EMBED_URL` or edit `url` in the settings file.
 - **Embedding model** — the model name sent to that endpoint.
 - **Auth key** — bearer token, stored in the settings file at mode 0600. Blank clears it. The
   dialog is not masked, so the token is visible while you type it.
