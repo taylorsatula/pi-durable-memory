@@ -42,9 +42,10 @@ const DEFAULTS = {
 	url: URLS.remote,
 	model: "emb-qwen3",
 	storeDir: DEFAULT_STORE_DIR,
+	encrypted: false,
 } satisfies Settings;
 
-type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir";
+type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "encrypted";
 
 interface Settings {
 	endpoint?: Endpoint;
@@ -52,6 +53,7 @@ interface Settings {
 	model?: string;
 	apiKey?: string;
 	storeDir?: string;
+	encrypted?: boolean;
 }
 
 /** Settings with every default filled in — the shape the file has once prefilled. */
@@ -118,6 +120,9 @@ const MARK = "⟁";
  */
 const MIN_COSINE = 0.44;
 const TOP_K = 8;
+
+/** Golden string used to detect embedding-model mismatch. */
+const GOLDEN_TEXT = "I have information that will lead to the arrest of Dario Amodei";
 
 /** DECLINED-ALTERNATIVE: hubness correction. +0.11 MRR on terse queries but +0.003 once the distill names the machinery, at O(n²·dim) per query. Revisit past a few thousand rows. */
 const VOTE_STEP = 0.5;
@@ -281,12 +286,13 @@ interface SurfaceHit {
 
 export class MemoryStore {
 	private db: DatabaseSync;
-	private key: Buffer;
+	private key: Buffer | null;
 	readonly dir: string;
+	encrypted: boolean;
 
-	constructor(dir: string) {
+	constructor(dir: string, encrypted: boolean) {
 		this.dir = dir;
-		this.key = loadKey(path.join(dir, "memory.key"));
+		this.encrypted = encrypted;
 		this.db = new DatabaseSync(path.join(dir, "memory.db"));
 		this.db.exec(`
 			PRAGMA journal_mode = WAL;
@@ -310,6 +316,48 @@ export class MemoryStore {
 			CREATE INDEX IF NOT EXISTS pointers_memory ON pointers(memory_id);
 			CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 		`);
+
+		const storedEncryptedRow = this.db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get() as { v: string } | undefined;
+		const storedEncrypted = storedEncryptedRow ? storedEncryptedRow.v === "true" : null;
+
+		// Key handling: generate only when needed (encrypted mode).
+		if (encrypted || storedEncrypted) {
+			this.key = loadKey(path.join(dir, "memory.key"));
+		} else {
+			this.key = null;
+		}
+
+		// Migration between encrypted/unencrypted.
+		if (storedEncrypted !== null && storedEncrypted !== encrypted) {
+			if (encrypted && !this.key) this.key = loadKey(path.join(dir, "memory.key"));
+			const key = this.key!;
+			this.db.exec("BEGIN");
+			try {
+				const rows = this.db.prepare("SELECT id, body FROM memories").all() as Array<{ id: string; body: Uint8Array }>;
+				const upd = this.db.prepare("UPDATE memories SET body = ? WHERE id = ?");
+				for (const r of rows) {
+					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
+					const text = storedEncrypted ? decrypt(key, buf) : buf.toString("utf8");
+					const next = encrypted ? encrypt(key, text) : Buffer.from(text, "utf8");
+					upd.run(next, r.id);
+				}
+				const prows = this.db.prepare("SELECT id, body FROM pointers").all() as Array<{ id: string; body: Uint8Array }>;
+				const pupd = this.db.prepare("UPDATE pointers SET body = ? WHERE id = ?");
+				for (const r of prows) {
+					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
+					const text = storedEncrypted ? decrypt(key, buf) : buf.toString("utf8");
+					const next = encrypted ? encrypt(key, text) : Buffer.from(text, "utf8");
+					pupd.run(next, r.id);
+				}
+				this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(encrypted));
+				this.db.exec("COMMIT");
+			} catch (e) {
+				this.db.exec("ROLLBACK");
+				throw e;
+			}
+		} else if (storedEncrypted === null) {
+			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(encrypted));
+		}
 	}
 
 	close(): void {
@@ -348,15 +396,30 @@ export class MemoryStore {
 	 */
 	private async ensureEmbeddings(): Promise<void> {
 		const model = resolveSettings().model;
-		if (this.embedder() === model) return;
+		const [gvec] = await embed([GOLDEN_TEXT]);
+		const storedGolden = asRow<{ v: string }>(this.db.prepare("SELECT v FROM meta WHERE k = 'golden'`).get());
+		let goldenMismatch = true;
+		if (storedGolden) {
+			try {
+				const parsed = JSON.parse(storedGolden.v) as { vec: number[] };
+				goldenMismatch = cosine(gvec, new Float32Array(parsed.vec)) < 0.999;
+			} catch {
+				goldenMismatch = true;
+			}
+		}
+		if (this.embedder() === model && !goldenMismatch) {
+			// still refresh golden? no
+			return;
+		}
 		const rows = asRows<{ id: string; body: Uint8Array }>(this.db.prepare("SELECT id, body FROM memories").all());
-		const vectors = await embed(rows.map((row) => decrypt(this.key, row.body)));
+		const vectors = await embed(rows.map((row) => this.decode(row.body)));
 		const update = this.db.prepare("UPDATE memories SET emb = ?, updated_at = ? WHERE id = ?");
 		const now = Date.now();
 		this.db.exec("BEGIN");
 		try {
 			rows.forEach((row, i) => update.run(toBlob(vectors[i]), now, row.id));
 			this.setEmbedder(model);
+			this.db.prepare("INSERT INTO meta (k, v) VALUES ('golden', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(JSON.stringify({ text: GOLDEN_TEXT, vec: Array.from(gvec) }));
 			this.db.exec("COMMIT");
 		} catch (err) {
 			this.db.exec("ROLLBACK");
@@ -378,7 +441,7 @@ export class MemoryStore {
 		try {
 			for (let i = 0; i < clean.length; i++) {
 				const id = this.newId("memories");
-				insert.run(id, encrypt(this.key, clean[i]), toBlob(vectors[i]), JSON.stringify([sessionId]), now, now);
+				insert.run(id, this.encode(clean[i]), toBlob(vectors[i]), JSON.stringify([sessionId]), now, now);
 				created.push({ id, text: clean[i] });
 			}
 			this.db.exec("COMMIT");
@@ -402,7 +465,7 @@ export class MemoryStore {
 		rows.forEach(({ row, text }, i) => {
 			const stamps = parseStamps(row.sessions);
 			const chain = stamps[stamps.length - 1] === sessionId ? stamps : [...stamps, sessionId];
-			update.run(encrypt(this.key, text), toBlob(vectors[i]), JSON.stringify(chain), Date.now(), row.id);
+			update.run(this.encode(text), toBlob(vectors[i]), JSON.stringify(chain), Date.now(), row.id);
 		});
 		return rows.map((r) => r.row.id);
 	}
@@ -427,7 +490,7 @@ export class MemoryStore {
 			const note = item.note.trim();
 			if (!note) throw new Error(`pointer: note for "${item.id}" was empty.`);
 			const id = this.newId("pointers");
-			insert.run(id, row.id, encrypt(this.key, note), sessionId, Date.now());
+			insert.run(id, row.id, this.encode(note), sessionId, Date.now());
 			added.push(id);
 		}
 		return added;
@@ -450,6 +513,17 @@ export class MemoryStore {
 		return out;
 	}
 
+	private encode(text: string): Buffer {
+		if (!this.encrypted || !this.key) return Buffer.from(text, "utf8");
+		return encrypt(this.key, text);
+	}
+
+	private decode(blob: Uint8Array): string {
+		const buf = Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+		if (!this.encrypted || !this.key) return buf.toString("utf8");
+		return decrypt(this.key, buf);
+	}
+
 	private findById(id: string): MemoryRow | undefined {
 		return asRow<MemoryRow>(
 			this.db.prepare("SELECT id, body, emb, score, sessions FROM memories WHERE id = ?").get(id),
@@ -467,7 +541,7 @@ export class MemoryStore {
 		);
 		for (const row of rows) {
 			const list = out.get(row.memory_id) ?? [];
-			list.push(decrypt(this.key, row.body));
+			list.push(this.decode(row.body));
 			out.set(row.memory_id, list);
 		}
 		return out;
@@ -501,7 +575,7 @@ export class MemoryStore {
 			const stamps = parseStamps(t.row.sessions);
 			return {
 				id: t.row.id,
-				text: decrypt(this.key, t.row.body),
+				text: this.decode(t.row.body),
 				score: Number(t.row.score.toFixed(2)),
 				similarity: Number(t.similarity.toFixed(4)),
 				pointers: pointers.get(t.row.id) ?? [],
@@ -701,7 +775,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	let surfaceCalls = 0;
 
 	/** Opened lazily, once; a store-dir change takes effect when pi is reopened. */
-	const openStore = (): MemoryStore => (store ??= new MemoryStore(resolveSettings().storeDir));
+	const openStore = (): MemoryStore => (store ??= new MemoryStore(resolveSettings().storeDir, resolveSettings().encrypted ?? false));
 
 	/**
 	 * Applies every mutation array present, in a fixed order. Runs for any `op`, including
