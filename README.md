@@ -4,10 +4,11 @@ Encrypted long-term memory for pi, retrieved by embedding similarity, driven by 
 loop the model runs on its own.
 
 The model opens a session with `surface` and gets back whatever past sessions decided was
-worth carrying forward. It closes each completed task with `finish`, which hands it a fixed
-alert telling it to store what it learned and rate what it was shown. Ratings move memories
-up and down future rankings. Bodies are AES-256-GCM encrypted in SQLite; their embeddings are
-not, because encrypted content cannot be searched.
+worth carrying forward, and surfaces again as the work moves to new ground. It records each
+completed task with `checkpoint`, which hands it a fixed alert telling it to store what it
+learned and rate what it was shown. Ratings move memories up and down future rankings.
+Bodies are AES-256-GCM encrypted in SQLite; their embeddings are not, because encrypted
+content cannot be searched.
 
 ```
 ├── index.ts        the extension
@@ -25,7 +26,7 @@ The store is not in the package. `memory.db` and `memory.key` are created on fir
 | op | Purpose |
 |---|---|
 | `surface` | Embed `query`, return the top-k matching memories decrypted, each with a short id |
-| `finish` | No input. Returns the same static closeout alert every time |
+| `checkpoint` | No input. Returns the same static checkpoint alert every time |
 | `create` | Store memories. Embeds the cleartext, encrypts the body, discards the cleartext |
 | `edit` | Replace a memory's text. Re-embeds and appends this session to its provenance chain |
 | `delete` | Remove memories permanently. Cascades to their pointers |
@@ -34,7 +35,7 @@ The store is not in the package. `memory.db` and `memory.key` are created on fir
 
 Every mutation array supplied on a call is applied regardless of which `op` names it, in the
 order delete → edit → create → pointer → helpful. That is deliberate: a model that attaches a
-payload to `finish` still has it stored rather than silently dropped. A mutation op that
+payload to `checkpoint` still has it stored rather than silently dropped. A mutation op that
 applies nothing throws rather than returning a no-op report. Ids are the full ids `surface`
 returned — an unknown id is an error.
 
@@ -45,14 +46,14 @@ session's call counts; the bare command opens the settings menu.
 
 Both triggers are phrased as checks the model can perform against its own transcript:
 
-- *If you have not yet called `surface` in this conversation, call it before your next tool call.*
-- *If you completed a task and have not called `finish` since, call it now.*
+- *If you have not yet called `surface` in this conversation, call it before your first state-changing action.*
+- *If you completed a task or just committed and have not called `checkpoint` since, call it now.*
 
 This wording is measured, not stylistic. An earlier version said "when you feel sufficiently
 oriented" and "when the session is drawing to a close". Across four live pi runs that phrasing
-produced `finish` zero times: a model cannot observe a session ending, and a trivial task has no
+produced `checkpoint` zero times: a model cannot observe a session ending, and a trivial task has no
 orientation phase to complete, so both triggers were skipped. Task-completion is observable and
-can fire mid-session, so a session that finishes three tasks closes out three times instead of
+can fire mid-session, so a session that completes three tasks checkpoints three times instead of
 never. See **Measured behavior** below.
 
 ## Provenance
@@ -177,11 +178,13 @@ full numbers and the reasoning behind both constants in `bench/README.md`.
 
 The single largest lever is not a constant — it is asking the model to name the surrounding
 subsystem alongside the goal. That instruction lives in the `query` parameter description. If
-retrieval regresses, look there first.
+retrieval regresses, look there first. The floor was also derived from two-part distills; the
+prompts since relaxed the query shape to one to three sentences, so treat the plus-row as the
+shaped-query ceiling, not a guarantee for bare one-sentence queries.
 
 Loop reliability, over live `pi --mode json` runs:
 
-| Run | Task shape | surface | finish |
+| Run | Task shape | surface | checkpoint |
 |---|---|---|---|
 | 1 | read-only investigation, real repo | action #2 of 5 | none *(felt-state wording)* |
 | 2 | write a scratch file | none *(felt-state wording)* | none |
@@ -191,7 +194,7 @@ Loop reliability, over live `pi --mode json` runs:
 
 Runs 1–2 used the felt-state wording. Runs 3–5 use the transcript-checkable wording. Run 4 is
 the loop working end to end; run 5 is the mid-session repeat that motivated the redesign. On
-routine tasks the model now sends an empty closeout rather than inventing a memory to comply.
+routine tasks the model now sends an empty checkpoint rather than inventing a memory to comply.
 
 n is small and every run used `glm-5.3` at thinking level `low` in `--print` mode. Interactive
 sessions were not tested. Treat these as direction, not a rate.

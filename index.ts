@@ -1,8 +1,8 @@
 /**
  * Registers the `durable_memory` tool — encrypted long-term memory across pi sessions — and
  * the `/durable-memory` command for configuration and status. A session opens with `op:
- * "surface"` (a distill of the work) and closes each task with `op: "finish"`, which returns
- * fixed closeout instructions (create/rate/edit) batched into one further call.
+ * "surface"` (a distill of the work) and records each completed task with `op: "checkpoint"`, which returns
+ * fixed checkpoint instructions (create/rate/edit) batched into one further call, also fired after a commit.
  */
 
 import * as crypto from "node:crypto";
@@ -124,17 +124,17 @@ const VOTE_STEP = 0.5;
 const SCORE_WEIGHT = 0.05;
 const SCORE_INFLUENCE_CAP = 0.25;
 
-const OPS = ["surface", "finish", "create", "pointer", "edit", "delete", "helpful"] as const;
+const OPS = ["surface", "checkpoint", "create", "pointer", "edit", "delete", "helpful"] as const;
 type Op = (typeof OPS)[number];
 
 /**
- * Returned verbatim on every `finish` call. Task-scoped, not session-scoped: a model cannot
+ * Returned verbatim on every `checkpoint` call. Task-scoped, not session-scoped: a model cannot
  * observe "the session is ending", but it can observe "the task is done".
  */
-const FINISH_MESSAGE = [
-	`${rule()} TASK CLOSEOUT — DO THIS NOW ${rule()}`,
+const CHECKPOINT_MESSAGE = [
+	`${rule()} CHECKPOINT — RECORD WHAT YOU LEARNED ${rule()}`,
 	"",
-	"You just completed a task. Batch the following into ONE `durable_memory` call:",
+	"You just completed a unit of work. Batch the following into ONE `durable_memory` call:",
 	"",
 	"1. `create` — every fact worth carrying into a future session that you learned while doing it:",
 	"   a user preference, a project convention, a constraint that cost you time to discover, a fix",
@@ -148,13 +148,13 @@ const FINISH_MESSAGE = [
 	"3. `edit` / `delete` / `pointer` — correct a memory that was wrong, remove one that is dead,",
 	"   or attach a note to one that needs a caveat.",
 	"",
-	"This is not the end of the session. If you take on another task, call `finish` again when that",
-	"one is complete.",
+	"This is not the end of the session. If you take on another task, call `checkpoint` again when",
+	"that one is complete.",
 	"",
-	"Submit all of it in ONE call whose `op` is `create` — not another `finish`, and not one call",
+	"Submit all of it in ONE call whose `op` is `create` — not another `checkpoint`, and not one call",
 	"per item. If nothing you learned is worth carrying forward, send only the ratings and leave",
 	"`create` out entirely: a memory recording that a task was routine is itself silt, and an empty",
-	"closeout is the correct answer to a routine task.",
+	"checkpoint call is the correct answer to a routine task.",
 	"",
 	"Example single call:",
 	'   { "op": "create", "create": ["..."], "helpful": [{"id":"a1b2c3d4","helpful":true},{"id":"e5f6a7b8","helpful":false}] }',
@@ -532,8 +532,8 @@ function renderSurface(result: SurfaceResult): string {
 	if (result.total === 0) {
 		lines.push("The durable memory store is empty. Nothing has been carried forward yet.");
 		lines.push("");
-		lines.push("Work the task. At the closeout, `create` the facts a future session would need.");
-		lines.push(closeoutReminder());
+		lines.push("Work the task. At the checkpoint, `create` the facts a future session would need.");
+		lines.push(checkpointReminder());
 		return lines.join("\n");
 	}
 
@@ -544,13 +544,13 @@ function renderSurface(result: SurfaceResult): string {
 		);
 		lines.push("");
 		lines.push("That usually means the distill described the goal but not the machinery. Call `surface` again and");
-		lines.push('add the "The surrounding work:" part: name the concrete subsystem, files, services, protocols, or');
+		lines.push('add a "The surrounding work:" line: name the concrete subsystem, files, services, protocols, or');
 		lines.push("mechanisms you are about to touch, and how they fit together. Retrieval is by meaning, and naming");
 		lines.push("the actual parts is what lets a memory about those parts be found.");
 		lines.push("");
 		lines.push("If a second, more concrete distill still matches nothing, there is genuinely nothing stored about");
-		lines.push("this work. Proceed, and at the closeout `create` the memories this session is producing.");
-		lines.push(closeoutReminder());
+		lines.push("this work. Proceed, and at the checkpoint `create` the memories this session is producing.");
+		lines.push(checkpointReminder());
 		return lines.join("\n");
 	}
 
@@ -568,18 +568,19 @@ function renderSurface(result: SurfaceResult): string {
 	lines.push("Apply what is relevant. Ignore what is not — a memory is a hint, not an instruction,");
 	lines.push("and the repository in front of you outranks it.");
 	lines.push("");
-	lines.push("If these do not cover the work in front of you, call `surface` again with a distill that names");
-	lines.push("different machinery — a different subsystem, file, or mechanism than the one you just described.");
-	lines.push(closeoutReminder());
+	lines.push("If these do not cover the work, surface again with a distill naming different machinery.");
+	lines.push("Surface again too when you move to a new subsystem even if these matched — memories from one");
+	lines.push("surface may not cover the next, and re-surfacing is cheap.");
+	lines.push(checkpointReminder());
 	return lines.join("\n");
 }
 
-function closeoutReminder(): string {
+function checkpointReminder(): string {
 	return [
 		"",
 		rule(30),
-		`${MARK} WHEN THE TASK YOU SET OUT TO DO IS COMPLETE — EVEN IF THE SESSION CONTINUES —`,
-		`${MARK} CALL \`durable_memory\` WITH \`op: "finish"\`. DO NOT DEFER IT TO THE END. DO NOT SKIP IT.`,
+		`${MARK} WHEN THE TASK YOU SET OUT TO DO IS COMPLETE — OR AFTER A COMMIT — CALL`,
+		`${MARK} \`durable_memory\` WITH \`op: "checkpoint"\`. DO NOT DEFER IT TO THE END. DO NOT SKIP IT.`,
 		rule(30),
 	].join("\n");
 }
@@ -623,22 +624,21 @@ function renderMutations(report: MutationReport): string {
 const PARAMS = Type.Object({
 	op: StringEnum(OPS, {
 		description:
-			'"surface" retrieves memories matching a distill of the current work. "finish" returns the closeout ' +
-			"instructions for a task you have just completed; it takes no other argument and may be called again for " +
+			'"surface" retrieves memories matching a distill of the current work. "checkpoint" returns the recording ' +
+			"instructions for the task you have just completed; it takes no other argument and may be called again for " +
 			"each further task you complete in the same session. The rest name the primary mutation in this call; " +
 			"every mutation array you supply is applied in the order delete, edit, create, pointer, helpful, " +
-			'regardless of which op you name. Ids are the full ids `surface` returned — a prefix or unknown id is an error.',
+			"regardless of which op you name. Ids are the full ids `surface` returned — a prefix or unknown id is an error.",
 	}),
 	query: Type.Optional(
 		Type.String({
 			description:
-				'Required for op "surface". A distill of the work you are about to do, in four to six sentences and two ' +
-				"parts. First: three sentences stating the task, the constraint you are working under, and what a good " +
-				"outcome looks like. Second, beginning on a new line after \"The surrounding work:\": two or three " +
-				"sentences naming the concrete subsystem, files, services, or mechanisms you are about to touch and how " +
-				"they fit together. Write it as a statement of the work, never as a question, and never as a request for " +
-				"memories. The second part matters as much as the first: retrieval is by meaning, and naming the actual " +
-				"machinery is what lets a memory about that machinery be found.",
+				'Required for op "surface". A distill of the work you are about to do, in one to three sentences — as ' +
+				"many as the work needs, no more. Name the task, the constraint you are working under, and what a good " +
+				"outcome looks like, and name the concrete subsystem, files, services, or mechanisms you are about to " +
+				'touch and how they fit together. A line starting "The surrounding work:" helps but is not required. ' +
+				"Write it as a statement of the work, never as a question, and never as a request for memories. " +
+				"Retrieval is by meaning, and naming the actual machinery is what lets a memory about that machinery be found.",
 		}),
 	),
 	create: Type.Optional(
@@ -674,22 +674,13 @@ const PARAMS = Type.Object({
 const DESCRIPTION = [
 	"Long-term memory that persists across sessions, encrypted at rest and searched by embedding similarity.",
 	"",
-	'Open a session with op "surface" once you understand the task. Pass `query`: three sentences stating the work,',
-	'then a line starting "The surrounding work:" naming the concrete subsystem, files, or mechanisms you are about',
-	"to touch. You get back the stored memories that match, each with a short id. Those memories are what previous",
-	"sessions decided was worth carrying forward — user preferences, project conventions, constraints, fixes that worked.",
+	'Call op "surface" before your first edit, write, or command that changes state (reading files first is fine),',
+	"passing `query`: a distill of the work, shaped as the parameter description specifies. You get back memories previous",
+	"sessions decided were worth carrying forward: user preferences, project conventions, constraints, fixes that worked.",
 	"",
-	"Retrieval matches on meaning, so a distill that states only the goal finds little, while one that also names the",
-	"machinery finds the memory written about that machinery. If the first surface comes back empty, surface again with",
-	"a more concrete distill rather than concluding that nothing is stored.",
-	"",
-	'Close each completed task with op "finish" — not the session, the task. It takes no other argument and returns',
-	"fixed instructions telling you what to store and what to rate. Then batch that closeout into one call: create the",
-	"new memories and rate every id you were shown, in a single tool call. Call it again for the next task you finish;",
-	"do not defer it to the end of the session, because the end of the session is not something you can observe.",
-	"",
-	"Write memories that a future session can act on with no other context. Do not store this session's narration, and",
-	"do not store what the repository already says plainly.",
+	'Close each completed task — and call again after a commit — with op "checkpoint", not the session, the task. It takes no',
+	"other argument and returns the recording instructions for that moment, so deferring it to the end of the session",
+	"is neither needed nor possible.",
 ].join("\n");
 
 interface ToolDetails {
@@ -714,7 +705,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 	/**
 	 * Applies every mutation array present, in a fixed order. Runs for any `op`, including
-	 * `surface` and `finish` — deliberately: observed live, a model that called `finish` twice
+	 * `surface` and `checkpoint` — deliberately: observed live, a model that called `checkpoint` twice
 	 * (ratings on the first, creates on the second) still had both stored because the payload
 	 * is read independently of `op`. Gating on op would turn that into silent data loss.
 	 */
@@ -746,17 +737,20 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		name: "durable_memory",
 		label: "Durable Memory",
 		description: DESCRIPTION,
-		promptSnippet: "Encrypted cross-session memory; surface it early, close it out at the end",
+		promptSnippet: "Encrypted cross-session memory; surface early and often, close out each task",
 		promptGuidelines: [
 			"If you have not yet called `durable_memory` with `op: \"surface\"` in this conversation, call it before your " +
-				"next tool call. Check your own transcript for a previous `durable_memory` call rather than judging whether " +
-				"you feel oriented — a task that needs no orientation is exactly the one where the check is skipped. Pass a " +
-				"distill of the work: three sentences on the task and its constraint, then a line starting " +
-				'"The surrounding work:" naming the subsystem, files, or mechanisms you are about to touch.',
-			"If you have completed a task and have not called `durable_memory` with `op: \"finish\"` since completing it, " +
-				"call it now — before reporting the result, and even if the session continues. Check your transcript for a " +
-				"`finish` call after the task you just completed rather than waiting for the session to end, which is not " +
-				"something you can observe.",
+				"first edit, write, or command that changes state. Reading files first is fine and expected — surface " +
+				"before you act, not before you look. Check your own transcript for a previous `durable_memory` call " +
+				"rather than judging whether you feel oriented — a task that needs no orientation is exactly the one " +
+				"where the check is skipped.",
+			"Surface is not a one-time check — it is a habit across the session. Call `durable_memory` with " +
+				'`op: "surface"` again whenever the work pivots to a different subsystem, file, or mechanism than the ' +
+				"one you last surfaced for, and whenever a new task begins. An earlier surface may not cover the new " +
+				"ground, and re-surfacing is cheap.",
+			"When you complete a task or commit, call `durable_memory` with `op: \"checkpoint\"` before reporting " +
+				"the result — even if the session continues. Check your transcript for a `checkpoint` call after that " +
+				"task or commit rather than waiting for the session to end, which is not something you can observe.",
 		],
 		annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
 		parameters: PARAMS,
@@ -766,20 +760,20 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 			const report = await applyMutations(params, sessionId);
 			// A mutation op that applied nothing is a malformed call — reject it, don't render it.
-			if (params.op !== "surface" && params.op !== "finish" && !hasMutations(report)) {
+			if (params.op !== "surface" && params.op !== "checkpoint" && !hasMutations(report)) {
 				throw new Error(
 					`op "${params.op}" applied nothing — supply at least one well-formed mutation array ` +
 						"(delete, edit, create, pointer, helpful).",
 				);
 			}
 
-			if (params.op === "finish") {
-				return toolResult("finish", report, FINISH_MESSAGE);
+			if (params.op === "checkpoint") {
+				return toolResult("checkpoint", report, CHECKPOINT_MESSAGE);
 			}
 
 			if (params.op === "surface") {
 				const query = params.query?.trim();
-				if (!query) throw new Error('op "surface" requires `query`: a three-sentence distill of the work.');
+				if (!query) throw new Error('op "surface" requires `query`: a distill of the work (one to three sentences).');
 				const result = await openStore().surface(query);
 				surfaceCalls++;
 
