@@ -6,7 +6,7 @@ member draws on, while each user still writes privately to their own local store
 
 ## How it works
 
-- Two stores: `local` (always present, writable) and `global` (optional, readable + annotatable).
+- Two stores: `local` (always present, writable) and `global` (optional, read-only).
 - `surface` queries both and merges the top results.
 - `create`, `edit`, `delete`, and `vote` always target `local`.
 ## Configuration
