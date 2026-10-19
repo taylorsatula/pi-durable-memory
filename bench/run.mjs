@@ -30,9 +30,14 @@ const corpus = JSON.parse(fs.readFileSync(CORPUS_PATH, "utf8")).memories;
 const negatives = JSON.parse(fs.readFileSync(NEG_PATH, "utf8"));
 const N = corpus.length;
 
-/** The credential chain mirrors ../index.ts: an explicit override, else pi's auth.json entry. */
+/** The credential chain mirrors ../index.ts: an explicit override, else the config file, else pi's auth.json entry. */
 function credential() {
 	if (process.env.DURABLE_MEMORY_EMBED_KEY) return process.env.DURABLE_MEMORY_EMBED_KEY;
+	const cfgPath = path.join(os.homedir(), ".pi", "agent", "durable-memory", "config.json");
+	if (fs.existsSync(cfgPath)) {
+		const key = JSON.parse(fs.readFileSync(cfgPath, "utf8")).apiKey;
+		if (key) return key;
+	}
 	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
 	const provider = process.env.DURABLE_MEMORY_EMBED_PROVIDER ?? "lunaroute";
 	const entry = JSON.parse(fs.readFileSync(authPath, "utf8"))[provider];

@@ -21,8 +21,8 @@ node bench/probe.mjs     # functional witness; exits non-zero on any failure
 node bench/run.mjs       # tuning sweep; add --no-cache to re-embed from scratch
 ```
 
-Both need the `lunaroute` credential in `~/.pi/agent/auth.json`, or
-`DURABLE_MEMORY_EMBED_KEY`. `probe.mjs` also needs `PI_NODE_MODULES` if it cannot find a pi
+Both need a `lunaroute` credential — in `~/.pi/agent/durable-memory/config.json`, or
+`~/.pi/agent/auth.json`, or `DURABLE_MEMORY_EMBED_KEY`. `probe.mjs` also needs `PI_NODE_MODULES` if it cannot find a pi
 install under `~/.pi/agent/install/releases`.
 
 `probe.mjs` skips its retrieval section with a visible failure if `corpus.json` is absent, so

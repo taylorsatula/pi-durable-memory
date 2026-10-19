@@ -51,15 +51,29 @@ const check = (name, cond, extra = "") => {
 const section = (t) => console.log(`\n${t}`);
 
 // ── Load the extension from a scratch copy ───────────────────────────
-// Everything the extension resolves hangs off the agent directory: the default store, the
-// settings file, and auth.json. Redirecting PI_CODING_AGENT_DIR is therefore the one lever that
+// Everything the extension resolves hangs off the agent directory: the default store and the
+// settings file. Redirecting PI_CODING_AGENT_DIR is therefore the one lever that
 // keeps this probe out of the operator's real store and real settings, whatever the default is.
 fs.rmSync(SCRATCH, { recursive: true, force: true });
 const AGENT = path.join(SCRATCH, "agent");
 fs.mkdirSync(AGENT, { recursive: true });
-fs.symlinkSync(path.join(os.homedir(), ".pi", "agent", "auth.json"), path.join(AGENT, "auth.json"));
 process.env.PI_CODING_AGENT_DIR = AGENT;
 delete process.env.DURABLE_MEMORY_DIR;
+// The extension takes its credential from env or its config file only. Source a real key into
+// env — from the operator's durable-memory config, or pi's auth.json — and never symlink the
+// whole config, which also names the operator's real store.
+if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
+	const realCfg = path.join(os.homedir(), ".pi", "agent", "durable-memory", "config.json");
+	if (fs.existsSync(realCfg)) process.env.DURABLE_MEMORY_EMBED_KEY = JSON.parse(fs.readFileSync(realCfg, "utf8")).apiKey;
+	if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
+		try {
+			const provider = process.env.DURABLE_MEMORY_EMBED_PROVIDER ?? "lunaroute";
+			const entry = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "auth.json"), "utf8"))[provider];
+			process.env.DURABLE_MEMORY_EMBED_KEY = entry?.key ?? entry?.access;
+		} catch {}
+	}
+}
+if (!process.env.DURABLE_MEMORY_EMBED_KEY) throw new Error("no embedding credential found; set DURABLE_MEMORY_EMBED_KEY");
 const SRC = path.join(SCRATCH, "index.ts");
 fs.copyFileSync(path.join(PKG, "index.ts"), SRC);
 const PROBE_STORE = path.join(AGENT, "durable-memory");
@@ -193,7 +207,7 @@ if (!corpus) {
 	const t = textOf(sample);
 	check("results render numbered with id, similarity, helpfulness", /\[1\] id: [0-9a-f]{8}\s+similarity: [\d.]+\s+helpfulness: [-\d.]+/.test(t), t.slice(0, 200));
 	check("results are capped at 8", (sample.details.hits ?? []).length <= 8);
-	check("ranks descend", (sample.details.hits ?? []).every((h, i, a) => i === 0 || a[i - 1].rank >= h.rank));
+	check("similarity descends within the top-k", (sample.details.hits ?? []).every((h, i, a) => i === 0 || a[i - 1].similarity >= h.similarity));
 	check("carries the strongly worded finish reminder", /DO NOT DEFER IT TO THE END/.test(t) && /DO NOT SKIP IT/.test(t), t.slice(-400));
 check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET OUT TO DO IS COMPLETE/.test(t) && /EVEN IF THE SESSION CONTINUES/.test(t));
 	check("offers a re-surface naming different machinery", /different machinery/.test(t));
@@ -247,10 +261,10 @@ check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET 
 // ── 6. encryption at rest ────────────────────────────────────────────
 section("[6] memory bodies are ciphertext at rest");
 const db = new DatabaseSync(DB, { readOnly: true });
-const rows = db.prepare("SELECT id, body, dim FROM memories").all();
+const rows = db.prepare("SELECT id, body, emb FROM memories").all();
 db.close();
 check("rows exist", rows.length > 0, String(rows.length));
-check("all vectors are 1024-dim emb-qwen3", rows.every((r) => r.dim === 1024), String(rows[0]?.dim));
+check("all vectors are 1024-dim emb-qwen3", rows.every((r) => Buffer.from(r.emb).length === 4096), String(rows[0] && Buffer.from(rows[0].emb).length));
 const needle = /mira|Taylor|banana|sqlite|embedding|memory|encrypted|pi extension/i;
 const leakedRows = rows.filter((r) => needle.test(Buffer.from(r.body).toString("latin1")));
 check("no plaintext survives in any stored body", leakedRows.length === 0, `${leakedRows.length} rows leaked`);
@@ -299,9 +313,6 @@ casc.close();
 check("deleting a memory cascades to its pointers", Number(orphan) === 0, String(orphan));
 check("row count is net +1 after create 2 / delete 1", n1 === n0 + 1, `${n0} -> ${n1}`);
 
-const noop = await call({ op: "create" });
-check("a call with no payload reports no changes", /No changes were supplied/.test(textOf(noop)));
-
 // ── 8. failure paths propagate ───────────────────────────────────────
 section("[8] failure paths propagate instead of returning empty");
 const throws = async (params, pattern) => {
@@ -316,8 +327,17 @@ check("surface without a query throws with guidance", (await throws({ op: "surfa
 check("edit on an unknown id throws", (await throws({ op: "edit", edit: [{ id: "ffffffff", text: "x" }] }, /no memory with id/)) === true);
 check("edit to empty text throws", (await throws({ op: "edit", edit: [{ id: newIds[1], text: "   " }] }, /was empty/)) === true);
 check("pointer on an unknown id throws", (await throws({ op: "pointer", pointer: [{ id: "ffffffff", note: "x" }] }, /no memory with id/)) === true);
-check("delete of an unknown id is a silent no-op, not a throw", (await call({ op: "delete", delete: ["ffffffff"] })).details.report.deleted.length === 0);
-check("create of only whitespace stores nothing", (await call({ op: "create", create: ["   "] })).details.report.created.length === 0);
+check("delete of an unknown id throws, not a silent no-op", (await throws({ op: "delete", delete: ["ffffffff"] }, /no memory with id/)) === true);
+check("a mutation op with no payload throws", (await throws({ op: "create" }, /applied nothing/)) === true);
+const countRows = () => {
+	const h = new DatabaseSync(DB, { readOnly: true });
+	try {
+		return Number(h.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
+	} finally {
+		h.close();
+	}
+};
+check("create of only whitespace throws and stores nothing", (await throws({ op: "create", create: ["   "] }, /applied nothing/)) === true && countRows() === n1, `${countRows()} vs ${n1}`);
 const aborted = await tool.execute("c", { op: "surface", query: "x" }, AbortSignal.abort(), undefined, ctx).then(() => false, (e) => /aborted/.test(e.message));
 check("an aborted signal throws before any network call", aborted === true);
 
@@ -345,7 +365,7 @@ check("status reports a memory count", /memories:\s+\d+/.test(status), status);
 check("status reports the endpoint and model", /endpoint:.*emb-qwen3/.test(status), status);
 check("status reports the auth-key source", /auth key:\s+\S/.test(status), status);
 check("status reports the active session", status.includes(SESSION), status);
-check("status reports surface and finish counts", /\d+ surface, \d+ finish/.test(status), status);
+check("status reports the surface-call count", /\d+ surface call/.test(status), status);
 
 await fire("session_shutdown");
 await fire("session_shutdown");
@@ -367,9 +387,17 @@ check("the store directory was created with mode 0700", (fs.statSync(PROBE_STORE
 check("settings live at a fixed path, not inside the movable store", mod.CONFIG_PATH === path.join(mod.DEFAULT_STORE_DIR, "config.json"), mod.CONFIG_PATH);
 
 section("[12] settings file drives endpoint, key, and directory");
-check("no settings file yet", mod.readSettings().endpoint === undefined);
 const CONFIG = mod.CONFIG_PATH;
-fs.mkdirSync(path.dirname(CONFIG), { recursive: true, mode: 0o700 });
+fs.rmSync(CONFIG, { force: true });
+const pre = mod.readSettings();
+check(
+	"a missing config prefills the defaults on read",
+	pre.endpoint === "remote" && pre.url === "https://gw.lunaroute.com/v1/embeddings" && pre.model === "emb-qwen3" && pre.storeDir === mod.DEFAULT_STORE_DIR,
+	JSON.stringify(pre),
+);
+check("the prefill is written to the file", JSON.parse(fs.readFileSync(CONFIG, "utf8")).model === "emb-qwen3");
+const envKey = process.env.DURABLE_MEMORY_EMBED_KEY;
+delete process.env.DURABLE_MEMORY_EMBED_KEY;
 const ALT_DIR = path.join(SCRATCH, "alt-store");
 fs.writeFileSync(
 	CONFIG,
@@ -382,7 +410,7 @@ check("endpoint is read", s.endpoint === "local");
 const resolved = mod.resolveSettings();
 check("url is read", resolved.url === "http://127.0.0.1:9999/v1/embeddings", resolved.url);
 check("model is read", resolved.model === "local-emb", resolved.model);
-check("apiKey is read and attributed to settings", resolved.apiKey === "cfg-secret" && resolved.keySource === "settings", resolved.keySource);
+check("apiKey is read from the config", resolved.apiKey === "cfg-secret" && resolved.keySource === "config", resolved.keySource);
 check("storeDir is read", resolved.storeDir === ALT_DIR, resolved.storeDir);
 check("the store reopens at the configured directory", path.join(resolved.storeDir, "memory.db") === path.join(ALT_DIR, "memory.db"));
 
@@ -393,10 +421,10 @@ delete process.env.DURABLE_MEMORY_DIR;
 process.env.DURABLE_MEMORY_EMBED_MODEL = "env-emb";
 check("DURABLE_MEMORY_EMBED_MODEL beats the settings file", mod.resolveSettings().model === "env-emb");
 delete process.env.DURABLE_MEMORY_EMBED_MODEL;
-check("with no file the default applies", (() => {
+check("with no file the defaults apply and the file is recreated", (() => {
 	fs.rmSync(CONFIG, { force: true });
 	const d = mod.resolveSettings();
-	return d.endpoint === "remote" && d.model === "emb-qwen3" && d.storeDir === mod.DEFAULT_STORE_DIR;
+	return d.endpoint === "remote" && d.model === "emb-qwen3" && d.storeDir === mod.DEFAULT_STORE_DIR && fs.existsSync(CONFIG);
 })());
 
 // A malformed settings file must fail loudly rather than silently reverting to defaults.
@@ -405,7 +433,7 @@ let badJson = false;
 try {
 	mod.readSettings();
 } catch (e) {
-	badJson = /not valid JSON/.test(e.message);
+	badJson = /config\.json/.test(e.message);
 }
 check("a malformed settings file fails loudly", badJson);
 fs.writeFileSync(CONFIG, JSON.stringify({ storeDir: path.join(SCRATCH, "node_modules", "x") }), { mode: 0o600 });
@@ -417,6 +445,7 @@ try {
 }
 check("a stored directory inside node_modules is refused", badDir);
 fs.rmSync(CONFIG, { force: true });
+if (envKey) process.env.DURABLE_MEMORY_EMBED_KEY = envKey;
 
 section("[13] settings command");
 const NOTICES = [];
@@ -457,8 +486,8 @@ const editCtx = {
 await captured.commands.get("durable-memory").handler("", editCtx);
 const after = mod.readSettings();
 check("choosing local writes endpoint=local", after.endpoint === "local", JSON.stringify(after));
-check("a stale url is cleared so the new endpoint's default applies", after.url === undefined);
-check("the resolved url follows the endpoint", mod.resolveSettings().url === "http://localhost:8080/v1/embeddings", mod.resolveSettings().url);
+check("the preset carries its url", after.url === "http://localhost:8080/v1/embeddings", JSON.stringify(after));
+check("the resolved url is the preset", mod.resolveSettings().url === "http://localhost:8080/v1/embeddings", mod.resolveSettings().url);
 check("the settings file was created 0600", (fs.statSync(CONFIG).mode & 0o777) === 0o600);
 fs.rmSync(CONFIG, { force: true });
 

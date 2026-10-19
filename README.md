@@ -34,7 +34,9 @@ The store is not in the package. `memory.db` and `memory.key` are created on fir
 
 Every mutation array supplied on a call is applied regardless of which `op` names it, in the
 order delete → edit → create → pointer → helpful. That is deliberate: a model that attaches a
-payload to `finish` still has it stored rather than silently dropped.
+payload to `finish` still has it stored rather than silently dropped. A mutation op that
+applies nothing throws rather than returning a no-op report. Ids are the full ids `surface`
+returned — an unknown id is an error.
 
 `/durable-memory status` reports the store size, paths, endpoint, credential source, and this
 session's call counts; the bare command opens the settings menu.
@@ -84,6 +86,7 @@ Run `/durable-memory` with no arguments for an interactive menu:
 
 ```
 Endpoint        remote — https://gw.lunaroute.com/v1/embeddings
+URL             https://gw.lunaroute.com/v1/embeddings
 Embedding model emb-qwen3
 Auth key        set (…a1b2, 40 chars)
 Database dir    /Users/you/.pi/agent/durable-memory
@@ -93,21 +96,23 @@ Done
 
 - **Endpoint** — `remote` for a hosted OpenAI-compatible endpoint
   (`https://gw.lunaroute.com/v1/embeddings`), `local` for a llama.cpp, Ollama or LM Studio
-  server on this machine (`http://localhost:8080/v1/embeddings`). The choice sets the URL; for
-  a non-default URL set `DURABLE_MEMORY_EMBED_URL` or edit `url` in the settings file.
+  server on this machine (`http://localhost:8080/v1/embeddings`). The preset carries its URL.
+- **URL** — the endpoint's address, editable for non-default gateways; blank restores the
+  endpoint's preset.
 - **Embedding model** — the model name sent to that endpoint.
 - **Auth key** — bearer token, stored in the settings file at mode 0600. Blank clears it. The
   dialog is not masked, so the token is visible while you type it.
 - **Database dir** — where `memory.db` and `memory.key` live. A path inside `node_modules` is
   refused, because an update would delete it.
 
-Every change is written to disk immediately, taking effect on the next tool call with no
-restart. A local endpoint does not require a key: if none is configured, the request is sent
+Every change is written to disk immediately. Endpoint, URL, model, and key take effect on the
+next tool call with no restart; a database-dir change needs pi reopened, and the menu says so.
+A local endpoint does not require a key: if none is configured, the request is sent
 without an `Authorization` header.
 
 Settings live at `~/.pi/agent/durable-memory/config.json`, mode 0600, at a fixed path so moving
-the database does not move the settings. `/durable-memory status` prints the resolved state
-without opening the menu.
+the database does not move the settings. A missing file is prefilled with the defaults on first
+read. `/durable-memory status` prints the resolved state without opening the menu.
 
 ### Environment variables
 
@@ -117,21 +122,18 @@ runs; the settings command is the normal path.
 | Variable | Overrides | Purpose |
 |---|---|---|
 | `DURABLE_MEMORY_EMBED_URL` | endpoint URL | Any OpenAI-compatible `/embeddings` |
-| `DURABLE_MEMORY_EMBED_MODEL` | model | Changing this invalidates stored vectors |
-| `DURABLE_MEMORY_EMBED_KEY` | auth key | Explicit credential; skips the settings file and `auth.json` |
-| `DURABLE_MEMORY_EMBED_PROVIDER` | — | Which `auth.json` entry to read when neither of the above is set |
+| `DURABLE_MEMORY_EMBED_MODEL` | model | Changing this triggers regeneration of stored vectors |
+| `DURABLE_MEMORY_EMBED_KEY` | auth key | Explicit credential; skips the settings file |
 | `DURABLE_MEMORY_DIR` | database dir | Where `memory.db` and `memory.key` live. Refused inside `node_modules`. |
 
 The credential chain, first hit wins: `DURABLE_MEMORY_EMBED_KEY`, then the settings file's
-`apiKey`, then `auth.json[provider].key`, then `auth.json[provider].access`. For a `local`
-endpoint an empty chain is fine and the header is omitted; for `remote` a missing credential
-raises with setup guidance rather than falling back. The shell-level `LUNAROUTE_API_KEY` is
-deliberately not consulted — pi's lunaroute provider authenticates with OAuth, and a stale
-shell key would be picked up ahead of the working one.
+`apiKey`. For a `local` endpoint an empty chain is fine and the header is omitted; for `remote`
+a missing credential raises with setup guidance rather than falling back.
 
-A changed embedding model does not silently corrupt the store. Vectors of a different dimension
-are skipped and counted, and `surface` tells the model to tell you that those memories need
-re-embedding or deleting.
+A changed embedding model does not silently corrupt the store. Every vector is tagged with the
+model name that wrote it; when the configured model differs, the next `surface` or `create`
+regenerates every embedding from its decrypted body in one batch. Vectors vary slightly across
+runs of the same model, so the model name — never vector comparison — is the trigger.
 
 ## Installing
 
