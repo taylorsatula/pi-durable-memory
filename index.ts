@@ -277,7 +277,6 @@ interface SurfaceHit {
 	text: string;
 	score: number;
 	similarity: number;
-	pointers: string[];
 	/** Newest stamp in the provenance chain — the session that last wrote this memory. */
 	session: string;
 	/** How many sessions have touched it. */
@@ -305,14 +304,6 @@ export class MemoryStore {
 				created_at INTEGER NOT NULL,
 				updated_at INTEGER NOT NULL
 			);
-			CREATE TABLE IF NOT EXISTS pointers (
-				id         TEXT PRIMARY KEY,
-				memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-				body       BLOB NOT NULL,
-				session_id TEXT NOT NULL,
-				created_at INTEGER NOT NULL
-			);
-			CREATE INDEX IF NOT EXISTS pointers_memory ON pointers(memory_id);
 			CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 		`);
 
@@ -360,7 +351,7 @@ export class MemoryStore {
 		}
 	}
 
-	private newId(table: "memories" | "pointers"): string {
+	private newId(table: "memories"): string {
 		for (let attempt = 0; attempt < 20; attempt++) {
 			const id = crypto.randomBytes(4).toString("hex");
 			if (!this.db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)) return id;
@@ -471,22 +462,6 @@ export class MemoryStore {
 		return ids;
 	}
 
-	async addPointers(items: Array<{ id: string; note: string }>, sessionId: string): Promise<string[]> {
-		const insert = this.db.prepare(
-			"INSERT INTO pointers (id, memory_id, body, session_id, created_at) VALUES (?, ?, ?, ?, ?)",
-		);
-		const added: string[] = [];
-		for (const item of items) {
-			const row = this.findById(item.id);
-			if (!row) throw new Error(`pointer: no memory with id "${item.id}".`);
-			const note = item.note.trim();
-			if (!note) throw new Error(`pointer: note for "${item.id}" was empty.`);
-			const id = this.newId("pointers");
-			insert.run(id, row.id, this.encode(note), sessionId, Date.now());
-			added.push(id);
-		}
-		return added;
-	}
 
 	/** true moves a memory up future rankings, false sinks it toward silt. */
 	vote(items: Array<{ id: string; helpful: boolean }>): Array<{ id: string; delta: number; missing: boolean }> {
@@ -529,7 +504,6 @@ export class MemoryStore {
 				}
 			};
 			rewrite("memories");
-			rewrite("pointers");
 			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(target));
 			this.db.exec("COMMIT");
 		} catch (e) {
@@ -557,22 +531,6 @@ export class MemoryStore {
 		);
 	}
 
-	private pointersFor(memoryIds: string[]): Map<string, string[]> {
-		const out = new Map<string, string[]>();
-		if (memoryIds.length === 0) return out;
-		const placeholders = memoryIds.map(() => "?").join(",");
-		const rows = asRows<{ memory_id: string; body: Uint8Array }>(
-			this.db
-				.prepare(`SELECT memory_id, body FROM pointers WHERE memory_id IN (${placeholders}) ORDER BY created_at`)
-				.all(...memoryIds),
-		);
-		for (const row of rows) {
-			const list = out.get(row.memory_id) ?? [];
-			list.push(this.decode(row.body));
-			out.set(row.memory_id, list);
-		}
-		return out;
-	}
 
 	/** Embeds the query, scores every stored memory, decrypts the top-k. */
 	async surface(query: string, limit = TOP_K): Promise<SurfaceResult> {
@@ -597,7 +555,6 @@ export class MemoryStore {
 		ranked.sort((a, b) => b.rank - a.rank);
 		const top = ranked.slice(0, limit);
 
-		const pointers = this.pointersFor(top.map((t) => t.row.id));
 		const hits: SurfaceHit[] = top.map((t) => {
 			const stamps = parseStamps(t.row.sessions);
 			return {
@@ -605,7 +562,6 @@ export class MemoryStore {
 				text: this.decode(t.row.body),
 				score: Number(t.row.score.toFixed(2)),
 				similarity: Number(t.similarity.toFixed(4)),
-				pointers: pointers.get(t.row.id) ?? [],
 				session: stamps[stamps.length - 1],
 				stamps: stamps.length,
 			};
@@ -661,9 +617,6 @@ function renderSurface(result: SurfaceResult): string {
 		lines.push(`[${i + 1}] id: ${hit.id}   similarity: ${hit.similarity}   helpfulness: ${hit.score}`);
 		lines.push(`    ${hit.text}`);
 		lines.push(`    ↳ last written by session ${hit.session.slice(0, 8)}${hit.stamps > 1 ? ` (${hit.stamps} sessions have touched it)` : ""}`);
-		for (const note of hit.pointers) {
-			lines.push(`    ↳ note: ${note}`);
-		}
 		lines.push("");
 	}
 	lines.push("Apply what is relevant. Ignore what is not — a memory is a hint, not an instruction,");
@@ -690,11 +643,10 @@ interface MutationReport {
 	created: Array<{ id: string; text: string }>;
 	edited: string[];
 	deleted: string[];
-	pointed: string[];
 	votes: Array<{ id: string; delta: number; missing: boolean }>;
 }
 
-const emptyReport = (): MutationReport => ({ created: [], edited: [], deleted: [], pointed: [], votes: [] });
+const emptyReport = (): MutationReport => ({ created: [], edited: [], deleted: [], votes: [] });
 
 const hasMutations = (report: MutationReport): boolean => Object.values(report).some((a) => a.length > 0);
 
@@ -705,7 +657,6 @@ function renderMutations(report: MutationReport): string {
 	}
 	if (report.edited.length) lines.push(`edited:   ${report.edited.join(", ")}`);
 	if (report.deleted.length) lines.push(`deleted:  ${report.deleted.join(", ")}`);
-	if (report.pointed.length) lines.push(`pointer:  ${report.pointed.join(", ")}`);
 	if (report.votes.length) {
 		lines.push(
 			`helpful:  ${report.votes.map((v) => `${v.id} ${v.delta > 0 ? "▲" : "▼"} ${v.delta > 0 ? "+" : ""}${v.delta}`).join(", ")}`,
@@ -838,16 +789,6 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		if (params.delete?.length) report.deleted = db.delete(params.delete);
 		if (params.edit?.length) report.edited = await db.edit(params.edit, sessionId);
 		if (params.create?.length) report.created = await db.create(params.create, sessionId);
-		if (params.pointer?.length) {
-			const stores = openStores();
-			const localItems = params.pointer.filter((p) => (p.store ?? "local") === "local");
-			const globalItems = params.pointer.filter((p) => p.store === "global");
-			const pointed: string[] = [];
-			if (localItems.length) pointed.push(...(await stores.local.addPointers(localItems, sessionId)));
-			if (globalItems.length && stores.global) pointed.push(...(await stores.global.addPointers(globalItems, sessionId)));
-			else if (globalItems.length && !stores.global) throw new Error('pointer with store "global" requires a global store to be configured.');
-			report.pointed = pointed;
-		}
 		if (params.helpful?.length) report.votes = db.vote(params.helpful);
 		return report;
 	}

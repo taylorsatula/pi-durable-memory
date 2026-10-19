@@ -30,11 +30,10 @@ The store is not in the package. `memory.db` and `memory.key` are created on fir
 | `create` | Store memories. Embeds the cleartext, encrypts the body, discards the cleartext |
 | `edit` | Replace a memory's text. Re-embeds and appends this session to its provenance chain |
 | `delete` | Remove memories permanently. Cascades to their pointers |
-| `pointer` | Attach a caveat or cross-reference, returned with the memory on every future surface. Accepts an optional `store` (`"local"`/`"global"`) when a global store is active |
 | `helpful` | Rate memories `true`/`false`, moving them up or down future rankings |
 
 Every mutation array supplied on a call is applied regardless of which `op` names it, in the
-order delete → edit → create → pointer → helpful. That is deliberate: a model that attaches a
+order delete → edit → create → helpful. That is deliberate: a model that attaches a
 payload to `checkpoint` still has it stored rather than silently dropped. A mutation op that
 applies nothing throws rather than returning a no-op report. Ids are the full ids `surface`
 returned — an unknown id is an error.
