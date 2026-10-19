@@ -519,22 +519,17 @@ export class MemoryStore {
 		const k = key as Buffer;
 		this.db.exec("BEGIN");
 		try {
-			const rows = this.db.prepare("SELECT id, body FROM memories").all() as Array<{ id: string; body: Uint8Array }>;
-			const upd = this.db.prepare("UPDATE memories SET body = ? WHERE id = ?");
-			for (const r of rows) {
-				const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
-				const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
-				const next = target ? encrypt(k, text) : Buffer.from(text, "utf8");
-				upd.run(next, r.id);
-			}
-			const prows = this.db.prepare("SELECT id, body FROM pointers").all() as Array<{ id: string; body: Uint8Array }>;
-			const pupd = this.db.prepare("UPDATE pointers SET body = ? WHERE id = ?");
-			for (const r of prows) {
-				const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
-				const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
-				const next = target ? encrypt(k, text) : Buffer.from(text, "utf8");
-				pupd.run(next, r.id);
-			}
+			const rewrite = (table: string) => {
+				const rows = this.db.prepare(`SELECT id, body FROM ${table}`).all() as Array<{ id: string; body: Uint8Array }>;
+				const upd = this.db.prepare(`UPDATE ${table} SET body = ? WHERE id = ?`);
+				for (const r of rows) {
+					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
+					const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
+					upd.run(target ? encrypt(k, text) : Buffer.from(text, "utf8"), r.id);
+				}
+			};
+			rewrite("memories");
+			rewrite("pointers");
 			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(target));
 			this.db.exec("COMMIT");
 		} catch (e) {
