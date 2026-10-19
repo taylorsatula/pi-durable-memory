@@ -42,10 +42,9 @@ const DEFAULTS = {
 	url: URLS.remote,
 	model: "emb-qwen3",
 	storeDir: DEFAULT_STORE_DIR,
-	encrypted: false,
 } satisfies Settings;
 
-type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "encrypted" | "globalStoreDir" | "globalEncrypted";
+type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "globalStoreDir";
 
 interface Settings {
 	endpoint?: Endpoint;
@@ -53,9 +52,7 @@ interface Settings {
 	model?: string;
 	apiKey?: string;
 	storeDir?: string;
-	encrypted?: boolean;
 	globalStoreDir?: string;
-	globalEncrypted?: boolean;
 }
 
 /** Settings with every default filled in — the shape the file has once prefilled. */
@@ -104,9 +101,7 @@ function resolveSettings() {
 		apiKey: fromEnv ?? s.apiKey,
 		keySource: fromEnv ? "env" : s.apiKey ? "config" : "none",
 		storeDir: assertStoreDir(process.env.DURABLE_MEMORY_DIR ?? s.storeDir),
-		encrypted: s.encrypted ?? false,
 		globalStoreDir: process.env.DURABLE_MEMORY_GLOBAL_DIR ? assertStoreDir(process.env.DURABLE_MEMORY_GLOBAL_DIR) : (s.globalStoreDir ? assertStoreDir(s.globalStoreDir) : undefined),
-		globalEncrypted: s.globalEncrypted ?? false,
 	};
 }
 
@@ -295,9 +290,8 @@ export class MemoryStore {
 	readonly dir: string;
 	encrypted: boolean;
 
-	constructor(dir: string, encrypted: boolean) {
+	constructor(dir: string) {
 		this.dir = dir;
-		this.encrypted = encrypted;
 		this.db = new DatabaseSync(path.join(dir, "memory.db"));
 		this.db.exec(`
 			PRAGMA journal_mode = WAL;
@@ -322,59 +316,39 @@ export class MemoryStore {
 			CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 		`);
 
-		const storedEncryptedRow = this.db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get() as { v: string } | undefined;
-		let storedEncrypted: boolean | null = storedEncryptedRow ? storedEncryptedRow.v === "true" : null;
-		// Legacy stores predate the 'encrypted' meta: detect by attempting to decrypt a row.
-		if (storedEncrypted === null && this.key) {
-			const sample = this.db.prepare("SELECT body FROM memories LIMIT 1").get() as { body: Uint8Array } | undefined;
-			if (sample) {
-				try {
-					decrypt(this.key, Buffer.from(sample.body.buffer, sample.body.byteOffset, sample.body.byteLength));
-					storedEncrypted = true;
-				} catch {
-					storedEncrypted = false;
+		// Determine mode from meta (single source of truth), with legacy bootstrap.
+		const metaRow = this.db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get() as { v: string } | undefined;
+		let mode: boolean;
+		if (metaRow) {
+			mode = metaRow.v === "true";
+		} else {
+			// Legacy bootstrap: detect encryption if a key exists and a sample decrypts.
+			const keyPath = path.join(dir, "memory.key");
+			let detected = false;
+			if (fs.existsSync(keyPath)) {
+				const key = fs.readFileSync(keyPath);
+				if (key.length === 32) {
+					const sample = this.db.prepare("SELECT body FROM memories LIMIT 1").get() as { body: Uint8Array } | undefined;
+					if (sample) {
+						try {
+							decrypt(key, Buffer.from(sample.body.buffer, sample.body.byteOffset, sample.body.byteLength));
+							detected = true;
+						} catch {
+							detected = false;
+						}
+					}
 				}
 			}
+			mode = detected;
+			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?)").run(String(mode));
 		}
+		this.encrypted = mode;
 
-		// Key handling: load if key file exists or encrypted mode requested (do not generate otherwise).
-		const keyPath = path.join(dir, "memory.key");
-		if (encrypted || fs.existsSync(keyPath)) {
-			this.key = loadKey(keyPath);
+		// Load key only when encrypted.
+		if (mode) {
+			this.key = loadKey(path.join(dir, "memory.key"));
 		} else {
 			this.key = null;
-		}
-
-		// Migration between encrypted/unencrypted.
-		if (storedEncrypted !== null && storedEncrypted !== encrypted) {
-			if (encrypted && !this.key) this.key = loadKey(path.join(dir, "memory.key"));
-			const key = this.key!;
-			this.db.exec("BEGIN");
-			try {
-				const rows = this.db.prepare("SELECT id, body FROM memories").all() as Array<{ id: string; body: Uint8Array }>;
-				const upd = this.db.prepare("UPDATE memories SET body = ? WHERE id = ?");
-				for (const r of rows) {
-					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
-					const text = storedEncrypted ? decrypt(key, buf) : buf.toString("utf8");
-					const next = encrypted ? encrypt(key, text) : Buffer.from(text, "utf8");
-					upd.run(next, r.id);
-				}
-				const prows = this.db.prepare("SELECT id, body FROM pointers").all() as Array<{ id: string; body: Uint8Array }>;
-				const pupd = this.db.prepare("UPDATE pointers SET body = ? WHERE id = ?");
-				for (const r of prows) {
-					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
-					const text = storedEncrypted ? decrypt(key, buf) : buf.toString("utf8");
-					const next = encrypted ? encrypt(key, text) : Buffer.from(text, "utf8");
-					pupd.run(next, r.id);
-				}
-				this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(encrypted));
-				this.db.exec("COMMIT");
-			} catch (e) {
-				this.db.exec("ROLLBACK");
-				throw e;
-			}
-		} else if (storedEncrypted === null) {
-			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(encrypted));
 		}
 	}
 
@@ -529,6 +503,46 @@ export class MemoryStore {
 			out.push({ id: row.id, delta, missing: false });
 		}
 		return out;
+	}
+
+	/** Explicitly switch encryption mode. Generates a key on first switch to encrypted. */
+	async switchEncryption(target: boolean): Promise<void> {
+		if (target === this.encrypted) return;
+		const keyPath = path.join(this.dir, "memory.key");
+		let key: Buffer | null = this.key;
+		if (target && !key) {
+			key = crypto.randomBytes(32);
+			fs.writeFileSync(keyPath, key, { mode: 0o600 });
+			fs.chmodSync(keyPath, 0o600);
+		}
+		if (!key && target) throw new Error("Could not obtain encryption key.");
+		const k = key as Buffer;
+		this.db.exec("BEGIN");
+		try {
+			const rows = this.db.prepare("SELECT id, body FROM memories").all() as Array<{ id: string; body: Uint8Array }>;
+			const upd = this.db.prepare("UPDATE memories SET body = ? WHERE id = ?");
+			for (const r of rows) {
+				const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
+				const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
+				const next = target ? encrypt(k, text) : Buffer.from(text, "utf8");
+				upd.run(next, r.id);
+			}
+			const prows = this.db.prepare("SELECT id, body FROM pointers").all() as Array<{ id: string; body: Uint8Array }>;
+			const pupd = this.db.prepare("UPDATE pointers SET body = ? WHERE id = ?");
+			for (const r of prows) {
+				const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
+				const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
+				const next = target ? encrypt(k, text) : Buffer.from(text, "utf8");
+				pupd.run(next, r.id);
+			}
+			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(target));
+			this.db.exec("COMMIT");
+		} catch (e) {
+			this.db.exec("ROLLBACK");
+			throw e;
+		}
+		this.encrypted = target;
+		this.key = target ? k : null;
 	}
 
 	private encode(text: string): Buffer {
@@ -796,8 +810,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	const openStores = (): { local: MemoryStore; global?: MemoryStore } => {
 		if (store) return store;
 		const r = resolveSettings();
-		const local = new MemoryStore(r.storeDir, r.encrypted);
-		const global = r.globalStoreDir ? new MemoryStore(r.globalStoreDir, r.globalEncrypted) : undefined;
+		const local = new MemoryStore(r.storeDir);
+		const global = r.globalStoreDir ? new MemoryStore(r.globalStoreDir) : undefined;
 		store = { local, global };
 		return store;
 	};
@@ -934,18 +948,34 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		for (;;) {
 			const s = readSettings();
 			const r = resolveSettings();
-			const rows: Array<[Key | "status" | "done", string]> = [
+			const rows: Array<[Key | "status" | "done" | "encrypt", string]> = [
 				["endpoint", `Endpoint        ${r.endpoint} — ${r.url}`],
 				["url", `URL             ${r.url}`],
 				["model", `Embedding model ${r.model}`],
 				["apiKey", `Auth key        ${r.apiKey ? `set (…${r.apiKey.slice(-4)})` : "not set"}`],
 				["storeDir", `Database dir    ${r.storeDir}`],
+				["encrypt", `Encryption     ${openStore().encrypted ? "encrypted" : "unencrypted"} (local)`],
 				["status", "Show status"],
 				["done", "Done"],
 			];
 			const picked = await ctx.ui.select("Durable memory", rows.map(([, label]) => label));
 			const key = rows.find(([, label]) => label === picked)?.[0];
 			if (!key || key === "done") return;
+			if (key === "encrypt") {
+				const db = openStore();
+				const target = !db.encrypted;
+				if (target && !fs.existsSync(path.join(db.dir, "memory.key"))) {
+					// generate on switchover
+				}
+				try {
+					await db.switchEncryption(target);
+					ctx.ui.notify(`Local store is now ${db.encrypted ? "encrypted" : "unencrypted"}.`, "info");
+				} catch (err) {
+					ctx.ui.notify((err as Error).message, "error");
+				}
+				continue;
+			}
+
 			if (key === "status") {
 				ctx.ui.notify(statusText(ctx), "info");
 				continue;
