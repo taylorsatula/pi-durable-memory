@@ -45,7 +45,7 @@ const DEFAULTS = {
 	encrypted: false,
 } satisfies Settings;
 
-type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "encrypted";
+type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "encrypted" | "globalStoreDir" | "globalEncrypted";
 
 interface Settings {
 	endpoint?: Endpoint;
@@ -54,6 +54,8 @@ interface Settings {
 	apiKey?: string;
 	storeDir?: string;
 	encrypted?: boolean;
+	globalStoreDir?: string;
+	globalEncrypted?: boolean;
 }
 
 /** Settings with every default filled in — the shape the file has once prefilled. */
@@ -102,6 +104,9 @@ function resolveSettings() {
 		apiKey: fromEnv ?? s.apiKey,
 		keySource: fromEnv ? "env" : s.apiKey ? "config" : "none",
 		storeDir: assertStoreDir(process.env.DURABLE_MEMORY_DIR ?? s.storeDir),
+		encrypted: s.encrypted ?? false,
+		globalStoreDir: process.env.DURABLE_MEMORY_GLOBAL_DIR ? assertStoreDir(process.env.DURABLE_MEMORY_GLOBAL_DIR) : (s.globalStoreDir ? assertStoreDir(s.globalStoreDir) : undefined),
+		globalEncrypted: s.globalEncrypted ?? false,
 	};
 }
 
@@ -730,10 +735,11 @@ const PARAMS = Type.Object({
 	),
 	delete: Type.Optional(Type.Array(Type.String(), { description: "Full ids of memories to remove permanently." })),
 	pointer: Type.Optional(
-		Type.Array(Type.Object({ id: Type.String(), note: Type.String() }), {
+		Type.Array(Type.Object({ id: Type.String(), note: Type.String(), store: Type.Optional(Type.String()) }), {
 			description:
 				"Attach a short caveat or cross-reference to an existing memory. The note is returned with that memory " +
-				"on every future surface, and does not alter its text or embedding.",
+				"on every future surface, and does not alter its text or embedding. When a second (global) store is " +
+				"active, set store to "global" to annotate a memory in that store; defaults to "local".",
 		}),
 	),
 	helpful: Type.Optional(
@@ -771,11 +777,19 @@ const toolResult = (op: string, report: MutationReport, text: string, extra?: Pa
 // ── Extension ────────────────────────────────────────────────────────
 
 export default function durableMemoryExtension(pi: ExtensionAPI) {
-	let store: MemoryStore | undefined;
+	let store: { local: MemoryStore; global?: MemoryStore } | undefined;
 	let surfaceCalls = 0;
 
-	/** Opened lazily, once; a store-dir change takes effect when pi is reopened. */
-	const openStore = (): MemoryStore => (store ??= new MemoryStore(resolveSettings().storeDir, resolveSettings().encrypted ?? false));
+	const openStores = (): { local: MemoryStore; global?: MemoryStore } => {
+		if (store) return store;
+		const r = resolveSettings();
+		const local = new MemoryStore(r.storeDir, r.encrypted);
+		const global = r.globalStoreDir ? new MemoryStore(r.globalStoreDir, r.globalEncrypted) : undefined;
+		store = { local, global };
+		return store;
+	};
+
+	const openStore = (): MemoryStore => openStores().local;
 
 	/**
 	 * Applies every mutation array present, in a fixed order. Runs for any `op`, including
@@ -802,7 +816,16 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		if (params.delete?.length) report.deleted = db.delete(params.delete);
 		if (params.edit?.length) report.edited = await db.edit(params.edit, sessionId);
 		if (params.create?.length) report.created = await db.create(params.create, sessionId);
-		if (params.pointer?.length) report.pointed = await db.addPointers(params.pointer, sessionId);
+		if (params.pointer?.length) {
+			const stores = openStores();
+			const localItems = params.pointer.filter((p) => (p.store ?? "local") === "local");
+			const globalItems = params.pointer.filter((p) => p.store === "global");
+			const pointed: string[] = [];
+			if (localItems.length) pointed.push(...(await stores.local.addPointers(localItems, sessionId)));
+			if (globalItems.length && stores.global) pointed.push(...(await stores.global.addPointers(globalItems, sessionId)));
+			else if (globalItems.length && !stores.global) throw new Error('pointer with store "global" requires a global store to be configured.');
+			report.pointed = pointed;
+		}
 		if (params.helpful?.length) report.votes = db.vote(params.helpful);
 		return report;
 	}
@@ -848,12 +871,22 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			if (params.op === "surface") {
 				const query = params.query?.trim();
 				if (!query) throw new Error('op "surface" requires `query`: a distill of the work (one to three sentences).');
-				const result = await openStore().surface(query);
+				const stores = openStores();
+				const results = await Promise.all(Object.entries(stores).filter(([, s]) => !!s).map(async ([name, s]) => ({ name, result: await s!.surface(query) })));
+				// merge ranked hits across stores by rank-ish: concatenate top lists, sort by similarity, slice
+				const mergedHits: SurfaceHit[] = [];
+				for (const { name, result } of results) {
+					for (const h of result.hits) mergedHits.push({ ...h, text: `[${name}] ${h.text}` });
+				}
+				// keep top K by similarity
+				mergedHits.sort((a, b) => b.similarity - a.similarity);
+				const top = mergedHits.slice(0, TOP_K);
+				const merged: SurfaceResult = { hits: top, total: results.reduce((n, r) => n + r.result.total, 0), bestMiss: Math.max(...results.map((r) => r.result.bestMiss), 0) };
 				surfaceCalls++;
 
-				const lines = [renderSurface(result)];
+				const lines = [renderSurface(merged)];
 				if (hasMutations(report)) lines.push("", "Applied in the same call:", renderMutations(report));
-				return toolResult("surface", report, lines.join("\n"), { hits: result.hits });
+				return toolResult("surface", report, lines.join("\n"), { hits: merged.hits });
 			}
 
 			return toolResult(params.op, report, renderMutations(report));
@@ -866,8 +899,9 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		try {
 			const r = resolveSettings();
 			const db = openStore();
-			return [
-				`memories:  ${db.count()}`,
+			const g = openStores().global;
+			const text = [
+				`memories:  ${db.count()}${g ? ` (local) + ${g.count()} (global)` : ""}`,
 				`store:     ${db.dir}`,
 				`settings:  ${CONFIG_PATH}`,
 				`endpoint:  ${r.endpoint} · ${r.model} @ ${r.url}`,
@@ -876,6 +910,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				`session:   ${ctx.sessionManager.getSessionId()}`,
 				`this session: ${surfaceCalls} surface call${surfaceCalls === 1 ? "" : "s"}`,
 			].join("\n");
+			return text;
 		} catch (err) {
 			return `durable memory unavailable: ${(err as Error).message}`;
 		}
@@ -959,7 +994,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		store?.close();
+		store?.local.close();
+		store?.global?.close();
 		store = undefined;
 	});
 }
