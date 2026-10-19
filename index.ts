@@ -323,11 +323,24 @@ export class MemoryStore {
 		`);
 
 		const storedEncryptedRow = this.db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get() as { v: string } | undefined;
-		const storedEncrypted = storedEncryptedRow ? storedEncryptedRow.v === "true" : null;
+		let storedEncrypted: boolean | null = storedEncryptedRow ? storedEncryptedRow.v === "true" : null;
+		// Legacy stores predate the 'encrypted' meta: detect by attempting to decrypt a row.
+		if (storedEncrypted === null && this.key) {
+			const sample = this.db.prepare("SELECT body FROM memories LIMIT 1").get() as { body: Uint8Array } | undefined;
+			if (sample) {
+				try {
+					decrypt(this.key, Buffer.from(sample.body.buffer, sample.body.byteOffset, sample.body.byteLength));
+					storedEncrypted = true;
+				} catch {
+					storedEncrypted = false;
+				}
+			}
+		}
 
-		// Key handling: generate only when needed (encrypted mode).
-		if (encrypted || storedEncrypted) {
-			this.key = loadKey(path.join(dir, "memory.key"));
+		// Key handling: load if key file exists or encrypted mode requested (do not generate otherwise).
+		const keyPath = path.join(dir, "memory.key");
+		if (encrypted || fs.existsSync(keyPath)) {
+			this.key = loadKey(keyPath);
 		} else {
 			this.key = null;
 		}
