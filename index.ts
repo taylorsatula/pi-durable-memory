@@ -129,7 +129,7 @@ const VOTE_STEP = 0.5;
 const SCORE_WEIGHT = 0.05;
 const SCORE_INFLUENCE_CAP = 0.25;
 
-const OPS = ["surface", "checkpoint", "create", "pointer", "edit", "delete", "helpful"] as const;
+const OPS = ["surface", "checkpoint", "create", "edit", "delete", "helpful"] as const;
 type Op = (typeof OPS)[number];
 
 /**
@@ -150,8 +150,7 @@ const CHECKPOINT_MESSAGE = [
 	"   changed what you did or saved you work; `false` if it was irrelevant or misleading. Ratings",
 	"   decide what surfaces next time, so an unrated memory is a wasted one. Guess rather than skip.",
 	"",
-	"3. `edit` / `delete` / `pointer` — correct a memory that was wrong, remove one that is dead,",
-	"   or attach a note to one that needs a caveat.",
+	"3. `edit` / `delete` — correct a memory that was wrong or remove one that is dead.",
 	"",
 	"This is not the end of the session. If you take on another task, call `checkpoint` again when",
 	"that one is complete.",
@@ -380,7 +379,7 @@ export class MemoryStore {
 	private async ensureEmbeddings(): Promise<void> {
 		const model = resolveSettings().model;
 		const [gvec] = await embed([GOLDEN_TEXT]);
-		const storedGolden = asRow<{ v: string }>(this.db.prepare("SELECT v FROM meta WHERE k = 'golden'`).get());
+		const storedGolden = asRow<{ v: string }>(this.db.prepare("SELECT v FROM meta WHERE k = 'golden'").get());
 		let goldenMismatch = true;
 		if (storedGolden) {
 			try {
@@ -679,7 +678,7 @@ const PARAMS = Type.Object({
 			'"surface" retrieves memories matching a distill of the current work. "checkpoint" returns the recording ' +
 			"instructions for the task you have just completed; it takes no other argument and may be called again for " +
 			"each further task you complete in the same session. The rest name the primary mutation in this call; " +
-			"every mutation array you supply is applied in the order delete, edit, create, pointer, helpful, " +
+			"every mutation array you supply is applied in the order delete, edit, create, helpful, " +
 			"regardless of which op you name. Ids are the full ids `surface` returned — a prefix or unknown id is an error.",
 	}),
 	query: Type.Optional(
@@ -707,14 +706,6 @@ const PARAMS = Type.Object({
 		}),
 	),
 	delete: Type.Optional(Type.Array(Type.String(), { description: "Full ids of memories to remove permanently." })),
-	pointer: Type.Optional(
-		Type.Array(Type.Object({ id: Type.String(), note: Type.String(), store: Type.Optional(Type.String()) }), {
-			description:
-				"Attach a short caveat or cross-reference to an existing memory. The note is returned with that memory " +
-				"on every future surface, and does not alter its text or embedding. When a second (global) store is " +
-				"active, set store to "global" to annotate a memory in that store; defaults to "local".",
-		}),
-	),
 	helpful: Type.Optional(
 		Type.Array(Type.Object({ id: Type.String(), helpful: Type.Boolean() }), {
 			description:
@@ -775,13 +766,12 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			delete?: string[];
 			edit?: Array<{ id: string; text: string }>;
 			create?: string[];
-			pointer?: Array<{ id: string; note: string }>;
 			helpful?: Array<{ id: string; helpful: boolean }>;
 		},
 		sessionId: string,
 	): Promise<MutationReport> {
 		const hasAny =
-			params.delete?.length || params.edit?.length || params.create?.length || params.pointer?.length || params.helpful?.length;
+			params.delete?.length || params.edit?.length || params.create?.length || params.helpful?.length;
 		if (!hasAny) return emptyReport();
 
 		const db = openStore();
@@ -823,7 +813,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			if (params.op !== "surface" && params.op !== "checkpoint" && !hasMutations(report)) {
 				throw new Error(
 					`op "${params.op}" applied nothing — supply at least one well-formed mutation array ` +
-						"(delete, edit, create, pointer, helpful).",
+						"(delete, edit, create, helpful).",
 				);
 			}
 

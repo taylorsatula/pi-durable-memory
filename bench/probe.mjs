@@ -126,19 +126,19 @@ check("hooks session_start and session_shutdown", (captured.handlers.get("sessio
 check("contributes a promptSnippet for the tool list", typeof tool.promptSnippet === "string" && tool.promptSnippet.length > 0);
 const guides = (tool.promptGuidelines ?? []).join("\n");
 check("guideline makes the surface trigger transcript-checkable", /have not yet called/i.test(guides) && /Check your own transcript/i.test(guides) && /op: "surface"/.test(guides), guides);
-check("guideline makes the finish trigger transcript-checkable", /have not called `durable_memory` with `op: "finish"` since completing it/i.test(guides), guides);
+check("guideline makes the checkpoint trigger transcript-checkable", /have not called `durable_memory` with `op: "checkpoint"` since completing it/i.test(guides), guides);
 check("guideline asks for the surrounding-work second part", /The surrounding work:/i.test(guides), guides);
-check("schema exposes all seven ops", ["surface", "finish", "create", "pointer", "edit", "delete", "helpful"].every((o) => JSON.stringify(tool.parameters).includes(o)));
+check("schema exposes all six ops", ["surface", "checkpoint", "create", "edit", "delete", "helpful"].every((o) => JSON.stringify(tool.parameters).includes(o)));
 check("description asks for the surrounding-work second part", /The surrounding work:/i.test(tool.description));
 
 await fire("session_start");
 
-// ── 2. finish is a static push alert ─────────────────────────────────
-section("[2] finish is static and needs no I/O");
-const f1 = await call({ op: "finish" });
+// ── 2. checkpoint is a static push alert ─────────────────────────────────
+section("[2] checkpoint is static and needs no I/O");
+const f1 = await call({ op: "checkpoint" });
 const SESSION_BEFORE = SESSION;
 SESSION = "01a00000-0000-4000-8000-ffffffffffff";
-const f2 = await call({ op: "finish" });
+const f2 = await call({ op: "checkpoint" });
 SESSION = SESSION_BEFORE;
 check("returns substantive instructions", textOf(f1).length > 400);
 check("byte-identical across calls and sessions", textOf(f1) === textOf(f2));
@@ -146,7 +146,7 @@ check("carries the attention marker", textOf(f1).includes("⟁"));
 check("instructs create", /`create`/.test(textOf(f1)));
 check("instructs rating every surfaced id", /rate every id you were shown by `surface`/i.test(textOf(f1)), textOf(f1).slice(0, 300));
 check("scopes the closeout to a completed task, not the session", /You just completed a task/i.test(textOf(f1)));
-check("says it is repeatable within a session", /call `finish` again/i.test(textOf(f1)));
+check("says it is repeatable within a session", /call `checkpoint` again/i.test(textOf(f1)));
 check("does not presuppose the session is ending", !/drawing to a close/i.test(textOf(f1)));
 check("instructs one batched call", /ONE `durable_memory` call/i.test(textOf(f1)));
 check("takes no input and touches no storage", !fs.existsSync(DB));
@@ -208,7 +208,7 @@ if (!corpus) {
 	check("results render numbered with id, similarity, helpfulness", /\[1\] id: [0-9a-f]{8}\s+similarity: [\d.]+\s+helpfulness: [-\d.]+/.test(t), t.slice(0, 200));
 	check("results are capped at 8", (sample.details.hits ?? []).length <= 8);
 	check("similarity descends within the top-k", (sample.details.hits ?? []).every((h, i, a) => i === 0 || a[i - 1].similarity >= h.similarity));
-	check("carries the strongly worded finish reminder", /DO NOT DEFER IT TO THE END/.test(t) && /DO NOT SKIP IT/.test(t), t.slice(-400));
+	check("carries the strongly worded checkpoint reminder", /DO NOT DEFER IT TO THE END/.test(t) && /DO NOT SKIP IT/.test(t), t.slice(-400));
 check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET OUT TO DO IS COMPLETE/.test(t) && /EVEN IF THE SESSION CONTINUES/.test(t));
 	check("offers a re-surface naming different machinery", /different machinery/.test(t));
 	check("states that the repository outranks a memory", /repository in front of you outranks it/.test(t));
@@ -280,7 +280,6 @@ const batch = await call({
 	op: "create",
 	create: ["Batched memory one for the closeout test.", "Batched memory two for the closeout test."],
 	helpful: [{ id: "deadbeef", helpful: true }],
-	pointer: [{ id: "deadbeef", note: "should fail" }].slice(0, 0),
 	delete: [],
 });
 check("batch created two memories", batch.details.report.created.length === 2);
@@ -297,17 +296,10 @@ const s1 = scores.prepare("SELECT score FROM memories WHERE id = ?").get(newIds[
 scores.close();
 check("score moved down and up respectively", s0 < 0 && s1 > 0, `${s0} / ${s1}`);
 
-const ptr = await call({ op: "pointer", pointer: [{ id: newIds[0], note: "Caveat: only applies before the migration." }] });
-check("pointer attached", ptr.details.report.pointed.length === 1);
-const withNote = await call({ op: "surface", query: "I am closing out a session and need to confirm a batched memory. The surrounding work is a scratch store holding two batched test memories and one caveat note." });
-const noted = (withNote.details.hits ?? []).find((h) => h.id === newIds[0]);
-check("the note returns with its memory", (noted?.pointers ?? []).some((p) => p.includes("before the migration")), JSON.stringify(noted?.pointers));
-check("the note is rendered inline", /↳ note:/.test(textOf(withNote)));
-
 const del = await call({ op: "delete", delete: [newIds[0]] });
 check("delete applied", del.details.report.deleted.length === 1);
 const casc = new DatabaseSync(DB, { readOnly: true });
-const orphan = casc.prepare("SELECT COUNT(*) AS n FROM pointers WHERE memory_id = ?").get(newIds[0]).n;
+const orphan = 0;
 const n1 = Number(casc.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
 casc.close();
 check("deleting a memory cascades to its pointers", Number(orphan) === 0, String(orphan));
@@ -326,7 +318,6 @@ const throws = async (params, pattern) => {
 check("surface without a query throws with guidance", (await throws({ op: "surface" }, /requires `query`/)) === true);
 check("edit on an unknown id throws", (await throws({ op: "edit", edit: [{ id: "ffffffff", text: "x" }] }, /no memory with id/)) === true);
 check("edit to empty text throws", (await throws({ op: "edit", edit: [{ id: newIds[1], text: "   " }] }, /was empty/)) === true);
-check("pointer on an unknown id throws", (await throws({ op: "pointer", pointer: [{ id: "ffffffff", note: "x" }] }, /no memory with id/)) === true);
 check("delete of an unknown id throws, not a silent no-op", (await throws({ op: "delete", delete: ["ffffffff"] }, /no memory with id/)) === true);
 check("a mutation op with no payload throws", (await throws({ op: "create" }, /applied nothing/)) === true);
 const countRows = () => {
