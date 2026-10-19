@@ -418,11 +418,11 @@ export class MemoryStore {
 		}
 		const rows = asRows<{ id: string; body: Uint8Array }>(this.db.prepare("SELECT id, body FROM memories").all());
 		const vectors = await embed(rows.map((row) => this.decode(row.body)));
-		const update = this.db.prepare("UPDATE memories SET emb = ?, updated_at = ? WHERE id = ?");
+		const update = this.db.prepare("UPDATE memories SET emb = ?, dim = ?, updated_at = ? WHERE id = ?");
 		const now = Date.now();
 		this.db.exec("BEGIN");
 		try {
-			rows.forEach((row, i) => update.run(toBlob(vectors[i]), now, row.id));
+			rows.forEach((row, i) => update.run(toBlob(vectors[i]), vectors[i].length, now, row.id));
 			this.setEmbedder(model);
 			this.db.prepare("INSERT INTO meta (k, v) VALUES ('golden', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(JSON.stringify({ text: GOLDEN_TEXT, vec: Array.from(gvec) }));
 			this.db.exec("COMMIT");
@@ -439,14 +439,14 @@ export class MemoryStore {
 		const vectors = await embed(clean);
 		const now = Date.now();
 		const insert = this.db.prepare(
-			"INSERT INTO memories (id, body, emb, score, sessions, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+			"INSERT INTO memories (id, body, emb, dim, score, sessions, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
 		);
 		const created: Array<{ id: string; text: string }> = [];
 		this.db.exec("BEGIN");
 		try {
 			for (let i = 0; i < clean.length; i++) {
 				const id = this.newId("memories");
-				insert.run(id, this.encode(clean[i]), toBlob(vectors[i]), JSON.stringify([sessionId]), now, now);
+				insert.run(id, this.encode(clean[i]), toBlob(vectors[i]), vectors[i].length, JSON.stringify([sessionId]), now, now);
 				created.push({ id, text: clean[i] });
 			}
 			this.db.exec("COMMIT");
@@ -466,11 +466,11 @@ export class MemoryStore {
 			return { row, text };
 		});
 		const vectors = await embed(rows.map((r) => r.text)); // one HTTP round trip for the whole batch
-		const update = this.db.prepare("UPDATE memories SET body = ?, emb = ?, sessions = ?, updated_at = ? WHERE id = ?");
+		const update = this.db.prepare("UPDATE memories SET body = ?, emb = ?, dim = ?, sessions = ?, updated_at = ? WHERE id = ?");
 		rows.forEach(({ row, text }, i) => {
 			const stamps = parseStamps(row.sessions);
 			const chain = stamps[stamps.length - 1] === sessionId ? stamps : [...stamps, sessionId];
-			update.run(this.encode(text), toBlob(vectors[i]), JSON.stringify(chain), Date.now(), row.id);
+			update.run(this.encode(text), toBlob(vectors[i]), vectors[i].length, JSON.stringify(chain), Date.now(), row.id);
 		});
 		return rows.map((r) => r.row.id);
 	}
