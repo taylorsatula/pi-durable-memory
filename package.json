@@ -1,6 +1,6 @@
 {
   "name": "@taylorsatula/pi-durable-memory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Encrypted, embedding-searched long-term memory for pi, with a surface/finish attention-sink loop",
   "keywords": [
     "pi-package",
