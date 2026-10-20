@@ -174,29 +174,28 @@ type Op = (typeof OPS)[number];
 const CHECKPOINT_MESSAGE = [
 	`${rule()} CHECKPOINT — RECORD WHAT YOU LEARNED ${rule()}`,
 	"",
-	"You just completed a unit of work. Batch the following into ONE `durable_memory` call:",
+	"You just completed a unit of work. Batch the following into ONE call:",
 	"",
-	"1. `create` — every fact worth carrying into a future session that you learned while doing it:",
-	"   a user preference, a project convention, a constraint that cost you time to discover, a fix",
-	"   that worked. One self-contained sentence each, readable with no other context. Do not store",
-	"   what is already obvious from the repository, and do not store this session's narration.",
+	"1. `create` — what a later session could not re-derive from the tree. One self-contained sentence.",
+	"   Tag every measurement with its witness. Where a surfaced id already carries the fact, `edit` it",
+	"   rather than `create` a second one.",
 	"",
-	"2. `helpful` — rate every id you were shown by `surface` and have not already rated. `true` if it",
-	"   changed what you did or saved you work; `false` if it was irrelevant or misleading. Ratings",
-	"   decide what surfaces next time, so an unrated memory is a wasted one. Guess rather than skip.",
+	"2. `helpful` — rate every id `surface` showed you and you have not rated: `true` if it changed what",
+	"   you did, `false` if it did not. Ratings decide what surfaces next; guess rather than skip.",
 	"",
-	"3. `edit` / `delete` — correct a memory that was wrong or remove one that is dead.",
+	"3. `edit` / `delete` — correct what is wrong, remove what is dead.",
 	"",
-	"This is not the end of the session. If you take on another task, call `checkpoint` again when",
-	"that one is complete.",
+	"`op` labels the call and selects nothing: every array in it applies, in the order delete, edit,",
+	"create, helpful.",
 	"",
-	"Submit all of it in ONE call whose `op` is `create` — not another `checkpoint`, and not one call",
-	"per item. If nothing you learned is worth carrying forward, send only the ratings and leave",
-	"`create` out entirely: a memory recording that a task was routine is itself silt, and an empty",
-	"checkpoint call is the correct answer to a routine task.",
-	"",
-	"Example single call:",
+	"Example:",
 	'   { "op": "create", "create": ["..."], "helpful": [{"id":"a1b2c3d4","helpful":true},{"id":"e5f6a7b8","helpful":false}] }',
+	"",
+	"If there is nothing to send, send nothing — never another `checkpoint`, which returns this message",
+	"and records nothing. An `op` that applies nothing is rejected.",
+	"",
+	"The next task begins with `surface`; call `checkpoint` again when it is complete, and after every",
+	"commit.",
 ].join("\n");
 
 function rule(width = 5): string {
@@ -796,12 +795,15 @@ function renderSurface(result: MergedSurface): string {
 	lines.push("and the repository in front of you outranks it.");
 	lines.push("");
 	lines.push("If these do not cover the work, surface again with a distill naming different machinery.");
-	lines.push("Surface again too when you move to a new subsystem even if these matched — memories from one");
-	lines.push("surface may not cover the next, and re-surfacing is cheap.");
+	lines.push("Surface again too when you move to a new subsystem, even if these matched.");
 	lines.push(checkpointReminder());
 	return lines.join("\n");
 }
 
+/**
+ * Appended on every `renderSurface` branch, not once per session: the repeated glyph ties a
+ * session's durable_memory calls into one thread, and dilution is the price. Do not thin it to once.
+ */
 function checkpointReminder(): string {
 	return [
 		"",
@@ -850,10 +852,10 @@ const PARAMS = Type.Object({
 	op: StringEnum(OPS, {
 		description:
 			'"surface" retrieves memories matching a distill of the current work. "checkpoint" returns the recording ' +
-			"instructions for the task you have just completed; it takes no other argument and may be called again for " +
-			"each further task you complete in the same session. The rest name the primary mutation in this call; " +
-			"every mutation array you supply is applied in the order delete, edit, create, helpful, " +
-			"regardless of which op you name. Ids are the full ids `surface` returned — a prefix or unknown id is an error.",
+			"instructions for the task you just completed; it takes no other argument and repeats per task. The rest " +
+			"label the call and select nothing: every array you supply applies, in the order delete, edit, create, " +
+			"helpful — delete first, so never delete and edit the same id in one call. Ids are the full ids `surface` " +
+			"returned; a prefix or unknown id is an error.",
 	}),
 	query: Type.Optional(
 		Type.String({
@@ -869,22 +871,24 @@ const PARAMS = Type.Object({
 	create: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Memory texts to store. One self-contained sentence each, readable with no other context: a user " +
-				'preference, a project convention, a constraint, a fix that worked. Example: ["The mira repo forbids mock ' +
-				'objects in tests; verification runs live probes against real infrastructure."]',
+				"Memory texts to store: what a later session could not re-derive from the tree, one self-contained " +
+				'sentence each. Example: ["The mira repo forbids mock objects in tests; verification runs live ' +
+				'probes against real infrastructure."]',
 		}),
 	),
 	edit: Type.Optional(
 		Type.Array(Type.Object({ id: Type.String(), text: Type.String() }), {
-			description: "Replace a stored memory's text. Re-embeds it and appends this session to its provenance chain.",
+			description:
+				"Replace a stored memory's text; re-embeds it and appends this session to its provenance chain. " +
+				"Where a surfaced id already carries the fact, `edit` it rather than `create` a variant.",
 		}),
 	),
 	delete: Type.Optional(Type.Array(Type.String(), { description: "Full ids of memories to remove permanently." })),
 	helpful: Type.Optional(
 		Type.Array(Type.Object({ id: Type.String(), helpful: Type.Boolean() }), {
 			description:
-				"Rate memories you were shown by `surface` this session. true raises their future ranking, false lowers " +
-				"it. Rate every id you were shown, including the ones that were merely irrelevant.",
+				"Rate every id `surface` showed you this session, including the merely irrelevant: true raises a " +
+				"memory's future ranking, false lowers it.",
 		}),
 	),
 });
@@ -892,13 +896,11 @@ const PARAMS = Type.Object({
 const DESCRIPTION = [
 	"Long-term memory that persists across sessions, searched by embedding similarity and optionally encrypted at rest.",
 	"",
-	'Call op "surface" before your first edit, write, or command that changes state (reading files first is fine),',
-	"passing `query`: a distill of the work, shaped as the parameter description specifies. You get back memories previous",
-	"sessions decided were worth carrying forward: user preferences, project conventions, constraints, fixes that worked.",
+	'op "surface" takes `query` — a distill of the work, shaped as the parameter description specifies — and returns what',
+	"earlier sessions could not re-derive from the tree.",
 	"",
-	'Close each completed task — and call again after a commit — with op "checkpoint", not the session, the task. It takes no',
-	"other argument and returns the recording instructions for that moment, so deferring it to the end of the session",
-	"is neither needed nor possible.",
+	'op "checkpoint" takes nothing and returns the recording instructions for one completed task — not for the session.',
+	"The other four store, correct, remove, and rate.",
 ].join("\n");
 
 interface ToolDetails {
@@ -971,12 +973,10 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			"If you have not yet called `durable_memory` with `op: \"surface\"` in this conversation, call it before your " +
 				"first edit, write, or command that changes state. Reading files first and speaking with the user is fine " +
 				"and expected — surface before you act, not before you look. Check your own transcript for a previous " +
-				"`durable_memory` call rather than judging whether you feel oriented — a task that needs no orientation is " +
-				"exactly the one where the check is skipped.",
+				"`durable_memory` call rather than judging whether you feel oriented.",
 			"Surface is not a one-time check — it is a habit across the session. Call `durable_memory` with " +
 				'`op: "surface"` again whenever the work pivots to a different subsystem, file, or mechanism than the ' +
-				"one you last surfaced for, and whenever a new task begins. An earlier surface may not cover the new " +
-				"ground, and re-surfacing is cheap.",
+				"one you last surfaced for, and whenever a new task begins.",
 			"When you complete a task or commit, call `durable_memory` with `op: \"checkpoint\"` before reporting " +
 				"the result — even if the session continues. Check your transcript for a `checkpoint` call after that " +
 				"task or commit rather than waiting for the session to end, which is not something you can observe.",

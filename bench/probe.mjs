@@ -135,12 +135,26 @@ check("guideline makes the checkpoint trigger transcript-checkable", /Check your
 check("schema exposes all six ops", ["surface", "checkpoint", "create", "edit", "delete", "helpful"].every((o) => JSON.stringify(tool.parameters).includes(o)));
 check("the query parameter asks for the surrounding-work second part", /The surrounding work:/i.test(JSON.stringify(tool.parameters)));
 check("the description says encryption is optional, not assumed", /optionally encrypted/i.test(tool.description), tool.description.slice(0, 140));
+const schema = JSON.stringify(tool.parameters);
+const BAR = "could not re-derive from the tree";
+check("the create parameter carries the storeability bar", schema.includes(BAR));
+check("the edit parameter names itself the merge path for a duplicate", /rather than `create` a variant/i.test(schema));
+check("names the delete-before-edit trap where it states the order", /delete first, so never delete and edit the same id/i.test(schema));
+// One reading moment owns one rule: the system prompt is a single moment, so the trigger lives in the
+// guidelines and the description describes the API. Across the permanent/transient boundary the
+// repetition is load-bearing; inside the permanent layer it is waste.
+check("the guidelines own the surface trigger", /call it before your first edit/i.test(guides), guides);
+check("the description owns the api and leaves the trigger alone", !/before your first edit/i.test(tool.description) && /op "surface" takes/i.test(tool.description), tool.description);
+check("the description names all six ops", ["surface", "checkpoint"].every((o) => tool.description.includes(o)) && /The other four store, correct, remove, and rate/.test(tool.description), tool.description);
 
 await fire("session_start");
 
 // ── 2. checkpoint is a static push alert ─────────────────────────────────
 section("[2] checkpoint is static and needs no I/O");
 const f1 = await call({ op: "checkpoint" });
+// Line wrapping is formatting, not wording: phrase checks run on the flattened text so a re-wrap
+// cannot fail a check that is about what the message says.
+const flat = textOf(f1).replace(/\s+/g, " ");
 const SESSION_BEFORE = SESSION;
 SESSION = "01a00000-0000-4000-8000-ffffffffffff";
 const f2 = await call({ op: "checkpoint" });
@@ -149,11 +163,19 @@ check("returns substantive instructions", textOf(f1).length > 400);
 check("byte-identical across calls and sessions", textOf(f1) === textOf(f2));
 check("carries the attention marker", textOf(f1).includes("⟁"));
 check("instructs create", /`create`/.test(textOf(f1)));
-check("instructs rating every surfaced id", /rate every id you were shown by `surface`/i.test(textOf(f1)), textOf(f1).slice(0, 300));
+check("instructs rating every surfaced id", /rate every id `surface` showed you/i.test(textOf(f1)), textOf(f1).slice(0, 300));
 check("scopes the closeout to a completed task, not the session", /You just completed a unit of work/i.test(textOf(f1)));
 check("says it is repeatable within a session", /call `checkpoint` again/i.test(textOf(f1)));
 check("does not presuppose the session is ending", !/drawing to a close/i.test(textOf(f1)));
-check("instructs one batched call", /ONE `durable_memory` call/i.test(textOf(f1)));
+check("instructs one batched call", /ONE call/i.test(textOf(f1)));
+check("says op labels the call rather than selecting what is applied", /labels the call and selects nothing/i.test(flat) && /every array in it applies/i.test(flat), flat);
+check("gives a routine task a sendable answer: silence, not an empty call", /send nothing/i.test(flat) && !/empty checkpoint call/i.test(flat));
+check("forbids answering the prompt with another checkpoint", /never another `checkpoint`/i.test(flat));
+check("carries an applicable storeability bar, not just a prohibition", flat.includes(BAR));
+check("one wording of the bar carries all three permanent homes and the message", [schema, tool.description, flat].every((t) => t.includes(BAR)), `${schema.includes(BAR)} ${tool.description.includes(BAR)} ${flat.includes(BAR)}`);
+check("routes a near-duplicate to edit instead of a second create", /already carries the fact, `edit` it rather than `create` a second one/i.test(flat), flat);
+check("closes the loop back to surface for the next task", /next task begins with `surface`/i.test(flat));
+check("no interpolation survives unfilled into the message", !/\$\{/.test(flat), flat);
 check("takes no input and touches no storage", !fs.existsSync(DB));
 
 // ── 3. empty store ───────────────────────────────────────────────────
@@ -216,6 +238,7 @@ if (!corpus) {
 	check("carries the strongly worded checkpoint reminder", /DO NOT DEFER IT TO THE END/.test(t) && /DO NOT SKIP IT/.test(t), t.slice(-400));
 	check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET OUT TO DO IS COMPLETE/.test(t) && /DO NOT DEFER IT TO THE END/.test(t) && !/when the session ends/i.test(t), t.slice(-400));
 	check("offers a re-surface naming different machinery", /different machinery/.test(t));
+check("keeps the re-surface trigger for a result that already matched", /even if these matched/.test(t), t.slice(-500));
 	check("states that the repository outranks a memory", /repository in front of you outranks it/.test(t));
 	check("details expose the provenance stamp", (sample.details.hits ?? []).every((h) => typeof h.session === "string" && h.stamps >= 1));
 
