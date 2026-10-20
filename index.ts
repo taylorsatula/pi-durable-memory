@@ -1,8 +1,11 @@
 /**
- * Registers the `durable_memory` tool — encrypted long-term memory across pi sessions — and
- * the `/durable-memory` command for configuration and status. A session opens with `op:
+ * Registers the `durable_memory` tool — long-term memory across pi sessions — and the
+ * `/durable-memory` command for configuration and status. A session opens with `op:
  * "surface"` (a distill of the work) and records each completed task with `op: "checkpoint"`, which returns
  * fixed checkpoint instructions (create/rate/edit) batched into one further call, also fired after a commit.
+ *
+ * Two stores can be active: the local one, always present and writable, and an optional global one
+ * seeded out of band and merged into `surface` read-only. Mutations only ever reach the local store.
  */
 
 import * as crypto from "node:crypto";
@@ -15,6 +18,7 @@ import type {
 	AgentToolResult,
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -30,21 +34,23 @@ const DEFAULT_STORE_DIR = path.join(AGENT_DIR, "durable-memory");
 /** Fixed, so that moving the store does not move the settings. */
 const CONFIG_PATH = path.join(DEFAULT_STORE_DIR, "config.json");
 
+/** Each endpoint has one canonical URL; that preset is the default, and the file only names a URL to override it. */
 const URLS = {
 	remote: "https://gw.lunaroute.com/v1/embeddings",
 	local: "http://localhost:8080/v1/embeddings",
 };
 type Endpoint = keyof typeof URLS;
+const ENDPOINTS = Object.keys(URLS) as Endpoint[];
 
-/** Every setting has a value here; a missing config file is prefilled with them. */
+/** Every setting has a value here; a missing config file is prefilled with them. `url` is absent by design — it inherits the endpoint's preset until overridden. */
 const DEFAULTS = {
 	endpoint: "remote" as Endpoint,
-	url: URLS.remote,
 	model: "emb-qwen3",
 	storeDir: DEFAULT_STORE_DIR,
 } satisfies Settings;
 
-type Key = "endpoint" | "url" | "model" | "apiKey" | "storeDir" | "globalStoreDir";
+const KEYS = ["endpoint", "url", "model", "apiKey", "storeDir", "globalStoreDir"] as const;
+type Key = (typeof KEYS)[number];
 
 interface Settings {
 	endpoint?: Endpoint;
@@ -58,6 +64,31 @@ interface Settings {
 /** Settings with every default filled in — the shape the file has once prefilled. */
 type Resolved = Settings & typeof DEFAULTS;
 
+/**
+ * The file is operator-editable, so a wrong type, an unknown endpoint, or a stray key fails here
+ * with the path in the message — not later, as a fetch error against a malformed URL.
+ */
+function checkedSettings(parsed: unknown): Settings {
+	if (typeof parsed !== "object" || parsed === null) throw new Error(`${CONFIG_PATH}: expected a JSON object.`);
+	const raw = parsed as Record<string, unknown>;
+	const unknown = Object.keys(raw).filter((k) => !(KEYS as readonly string[]).includes(k));
+	if (unknown.length) {
+		throw new Error(`${CONFIG_PATH}: unknown setting${unknown.length === 1 ? "" : "s"} ${unknown.join(", ")}.`);
+	}
+	const out: Record<string, string> = {};
+	for (const key of KEYS) {
+		const value = raw[key];
+		if (value === undefined) continue; // absent means "take the default", not "clear it"
+		if (typeof value !== "string") throw new Error(`${CONFIG_PATH}: "${key}" must be a string, got ${typeof value}.`);
+		out[key] = value;
+	}
+	if (out.endpoint && !(out.endpoint in URLS)) {
+		throw new Error(`${CONFIG_PATH}: endpoint "${out.endpoint}" is not one of ${Object.keys(URLS).join(", ")}.`);
+	}
+	return out as Settings;
+}
+
+/** Reads the settings file, prefilling it with the defaults on first run so every key is visible and editable. */
 function readSettings(): Resolved {
 	if (!fs.existsSync(CONFIG_PATH)) {
 		writeSettings(DEFAULTS);
@@ -69,8 +100,7 @@ function readSettings(): Resolved {
 	} catch (err) {
 		throw new Error(`${CONFIG_PATH}: ${(err as Error).message}`);
 	}
-	const s = { ...DEFAULTS, ...(parsed as object) } as Resolved;
-	return s;
+	return { ...DEFAULTS, ...checkedSettings(parsed) };
 }
 
 function writeSettings(settings: Settings): void {
@@ -94,14 +124,19 @@ function assertStoreDir(dir: string): string {
 function resolveSettings() {
 	const s = readSettings();
 	const fromEnv = process.env.DURABLE_MEMORY_EMBED_KEY;
+	const globalDir = process.env.DURABLE_MEMORY_GLOBAL_DIR ?? s.globalStoreDir;
+	// A stored URL equal to the endpoint's own preset is not an override, so it reads as the default.
+	const override = s.url && s.url !== URLS[s.endpoint] ? s.url : undefined;
+	const fromEnvUrl = process.env.DURABLE_MEMORY_EMBED_URL;
 	return {
 		endpoint: s.endpoint,
-		url: process.env.DURABLE_MEMORY_EMBED_URL ?? s.url,
+		url: fromEnvUrl ?? override ?? URLS[s.endpoint],
+		urlOverridden: Boolean(fromEnvUrl ?? override),
 		model: process.env.DURABLE_MEMORY_EMBED_MODEL ?? s.model,
 		apiKey: fromEnv ?? s.apiKey,
 		keySource: fromEnv ? "env" : s.apiKey ? "config" : "none",
 		storeDir: assertStoreDir(process.env.DURABLE_MEMORY_DIR ?? s.storeDir),
-		globalStoreDir: process.env.DURABLE_MEMORY_GLOBAL_DIR ? assertStoreDir(process.env.DURABLE_MEMORY_GLOBAL_DIR) : (s.globalStoreDir ? assertStoreDir(s.globalStoreDir) : undefined),
+		globalStoreDir: globalDir ? assertStoreDir(globalDir) : undefined,
 	};
 }
 
@@ -185,24 +220,31 @@ function decrypt(key: Buffer, blob: Uint8Array): string {
 	return Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString("utf8");
 }
 
+/** 0600, and an explicit chmod because writeFileSync's mode is masked by umask and ignores an existing file's. */
+function writeKey(keyPath: string, key: Buffer): void {
+	fs.mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
+	fs.writeFileSync(keyPath, key, { mode: 0o600 });
+	fs.chmodSync(keyPath, 0o600);
+}
+
 /** Creates the store directory if absent (0700) and the keyfile on first use (0600). */
 function loadKey(keyPath: string): Buffer {
-	fs.mkdirSync(path.dirname(keyPath), { recursive: true, mode: 0o700 });
 	if (fs.existsSync(keyPath)) {
 		const raw = fs.readFileSync(keyPath);
 		if (raw.length !== 32) throw new Error(`${keyPath} is ${raw.length} bytes, expected 32. Delete it to regenerate.`);
 		return raw;
 	}
 	const key = crypto.randomBytes(32);
-	fs.writeFileSync(keyPath, key, { mode: 0o600 });
-	fs.chmodSync(keyPath, 0o600);
+	writeKey(keyPath, key);
 	return key;
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────
 
+const EMBED_TIMEOUT_MS = 30_000;
+
 /** OpenAI-compatible /embeddings. Throws on any non-2xx or malformed response — no silent zeros. */
-async function embed(texts: string[]): Promise<Float32Array[]> {
+async function embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
 	if (texts.length === 0) return [];
 	const cfg = resolveSettings(); // per call, so settings changes take effect without a restart
 	if (!cfg.apiKey && cfg.endpoint !== "local") {
@@ -214,11 +256,13 @@ async function embed(texts: string[]): Promise<Float32Array[]> {
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
+	const timeout = AbortSignal.timeout(EMBED_TIMEOUT_MS);
 	const res = await fetch(cfg.url, {
 		method: "POST",
 		headers,
 		body: JSON.stringify({ model: cfg.model, input: texts }),
-		signal: AbortSignal.timeout(30_000),
+		// The caller's signal too: aborting a turn should stop the embedding request, not just its rendering.
+		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 	});
 	const body = await res.text();
 	if (!res.ok) {
@@ -253,15 +297,11 @@ function cosine(a: Float32Array, b: Float32Array): number {
 
 // ── Store ────────────────────────────────────────────────────────────
 
-function asRow<T>(row: unknown): T | undefined {
-	return row as T | undefined;
-}
-function asRows<T>(rows: unknown): T[] {
-	return rows as T[];
-}
 function toBlob(vec: Float32Array): Buffer {
 	return Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
 }
+
+type SqlValue = null | number | bigint | string | Uint8Array;
 
 interface MemoryRow {
 	id: string;
@@ -276,70 +316,106 @@ interface SurfaceHit {
 	text: string;
 	score: number;
 	similarity: number;
-	/** Newest stamp in the provenance chain — the session that last wrote this memory. */
-	session: string;
+	/** Similarity plus the helpfulness influence: the one ordering key, comparable across stores. */
+	rank: number;
+	/** Newest stamp in the provenance chain — the session that last wrote this memory, if it is stamped. */
+	session: string | undefined;
 	/** How many sessions have touched it. */
 	stamps: number;
 }
 
+/** The stores a session can search: the writable local one, plus an optional seeded global one. */
+interface Stores {
+	local: MemoryStore;
+	global?: MemoryStore;
+}
+
+// ── LEGACY STORE MIGRATION — temporary, cut whole ─────────────────────
+/**
+ * Brings a store written by any release before 0.3.5 up to the current shape. Three shapes ever
+ * existed and this handles all of them:
+ *
+ *   0.1.0–0.2.0  dim, surfaces, pointers, meta('embedder')       — always encrypted, no mode row
+ *   0.2.x–0.3.4  pointers, meta('embedder')                      — always encrypted, no mode row
+ *   0.3.5+       current columns, meta('encrypted')              — already current
+ *
+ * Every pre-0.3.5 release encrypted unconditionally and recorded no mode, so a store lacking the
+ * `encrypted` key is read from its keyfile: present and 32 bytes means encrypted. (A 0.3.5 store
+ * switched off keeps its keyfile but carries the mode, so it never takes this path.)
+ *
+ * Idempotent, and cheap on a current store: three schema reads and one meta read. Delete this
+ * function and its one call in the MemoryStore constructor a few weeks after 0.3.5, once old stores
+ * are out of circulation.
+ */
+function migrateLegacyStore(db: DatabaseSync, dir: string): void {
+	const columns = (db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map((c) => c.name);
+	// 0.2.0 dropped both columns but every store created before it still declares them. Neither held
+	// anything irreplaceable: `surfaces` was an occurred-count and `dim` is `length(emb) / 4`. `dim`
+	// was NOT NULL with no default, so leaving it would fail every insert into such a store.
+	for (const dead of ["dim", "surfaces"]) {
+		if (columns.includes(dead)) db.exec(`ALTER TABLE memories DROP COLUMN ${dead}`);
+	}
+	// The pointer op is gone, so its rows are unreachable — and switchEncryption no longer rewrites
+	// them, which would leave undecryptable bodies behind in a table nothing reads.
+	if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pointers'").get()) {
+		db.exec("DROP INDEX IF EXISTS pointers_memory; DROP TABLE pointers;");
+	}
+	// Record the mode these stores never had, so the running code reads it instead of guessing.
+	if (!db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get()) {
+		const keyPath = path.join(dir, "memory.key");
+		const encrypted = fs.existsSync(keyPath) && fs.statSync(keyPath).size === 32;
+		db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?)").run(String(encrypted));
+	}
+}
+// ── END LEGACY STORE MIGRATION ────────────────────────────────────────
+
 export class MemoryStore {
 	private db: DatabaseSync;
 	private key: Buffer | null;
+	/** Set once this session has confirmed the stored vectors match the configured model. */
+	private vectorsChecked = false;
 	readonly dir: string;
+	/** A read-only store is searched and never written: no migration, no re-embedding, no mode switch. */
+	readonly readOnly: boolean;
 	encrypted: boolean;
 
-	constructor(dir: string) {
+	constructor(dir: string, opts: { readOnly?: boolean } = {}) {
 		this.dir = dir;
+		this.readOnly = opts.readOnly === true;
+		// A writable store owns its directory: create it, and keep it owner-only like the keyfile.
+		if (!this.readOnly) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 		this.db = new DatabaseSync(path.join(dir, "memory.db"));
-		this.db.exec(`
-			PRAGMA journal_mode = WAL;
-			PRAGMA busy_timeout = 5000;
-			CREATE TABLE IF NOT EXISTS memories (
-				id         TEXT PRIMARY KEY,
-				body       BLOB NOT NULL,
-				emb        BLOB NOT NULL,
-				score      REAL NOT NULL DEFAULT 0,
-				sessions   TEXT NOT NULL DEFAULT '[]',
-				created_at INTEGER NOT NULL,
-				updated_at INTEGER NOT NULL
-			);
-			CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-		`);
-
-		// Determine mode from meta (single source of truth), with legacy bootstrap.
-		const metaRow = this.db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get() as { v: string } | undefined;
-		let mode: boolean;
-		if (metaRow) {
-			mode = metaRow.v === "true";
-		} else {
-			// Legacy bootstrap: detect encryption if a key exists and a sample decrypts.
-			const keyPath = path.join(dir, "memory.key");
-			let detected = false;
-			if (fs.existsSync(keyPath)) {
-				const key = fs.readFileSync(keyPath);
-				if (key.length === 32) {
-					const sample = this.db.prepare("SELECT body FROM memories LIMIT 1").get() as { body: Uint8Array } | undefined;
-					if (sample) {
-						try {
-							decrypt(key, Buffer.from(sample.body.buffer, sample.body.byteOffset, sample.body.byteLength));
-							detected = true;
-						} catch {
-							detected = false;
-						}
-					}
+		this.db.exec("PRAGMA busy_timeout = 5000;");
+		if (this.readOnly) {
+			// Seeded out of band, so it is opened exactly as it stands: no WAL switch, no schema write.
+			for (const table of ["memories", "meta"]) {
+				if (!this.one("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table)) {
+					throw new Error(
+						`${dir} holds no memory database (missing "${table}"). Seed it with scripts/seed-global.mjs — see docs/global-store.md.`,
+					);
 				}
 			}
-			mode = detected;
-			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?)").run(String(mode));
-		}
-		this.encrypted = mode;
-
-		// Load key only when encrypted.
-		if (mode) {
-			this.key = loadKey(path.join(dir, "memory.key"));
 		} else {
-			this.key = null;
+			this.db.exec(`
+				PRAGMA journal_mode = WAL;
+				CREATE TABLE IF NOT EXISTS memories (
+					id         TEXT PRIMARY KEY,
+					body       BLOB NOT NULL,
+					emb        BLOB NOT NULL,
+					score      REAL NOT NULL DEFAULT 0,
+					sessions   TEXT NOT NULL DEFAULT '[]',
+					created_at INTEGER NOT NULL,
+					updated_at INTEGER NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+			`);
+			migrateLegacyStore(this.db, dir); // LEGACY MIGRATION — remove with its section
 		}
+
+		// Migration records the mode on any pre-0.3.5 store, so this is a plain read. A read-only store
+		// was seeded out of band and is never written, so its mode comes from whoever seeded it.
+		this.encrypted = this.one<{ v: string }>("SELECT v FROM meta WHERE k = 'encrypted'")?.v === "true";
+		this.key = this.encrypted ? loadKey(path.join(dir, "memory.key")) : null;
 	}
 
 	close(): void {
@@ -350,91 +426,132 @@ export class MemoryStore {
 		}
 	}
 
-	private newId(table: "memories"): string {
+	private newId(): string {
 		for (let attempt = 0; attempt < 20; attempt++) {
 			const id = crypto.randomBytes(4).toString("hex");
-			if (!this.db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)) return id;
+			if (!this.one("SELECT 1 FROM memories WHERE id = ?", id)) return id;
 		}
-		throw new Error(`Could not allocate a free ${table} id after 20 attempts.`);
+		throw new Error("Could not allocate a free memory id after 20 attempts.");
+	}
+
+	/** node:sqlite hands back untyped rows; these two keep the casts in one place. */
+	private all<T>(sql: string, ...args: SqlValue[]): T[] {
+		return this.db.prepare(sql).all(...args) as T[];
+	}
+
+	private one<T>(sql: string, ...args: SqlValue[]): T | undefined {
+		return this.db.prepare(sql).get(...args) as T | undefined;
 	}
 
 	/** The embedder whose vectors live in this DB. A changed model means incomparable vectors. */
 	embedder(): string | undefined {
-		return asRow<{ v: string }>(this.db.prepare("SELECT v FROM meta WHERE k = 'embedder'").get())?.v;
+		return this.one<{ v: string }>("SELECT v FROM meta WHERE k = 'embedder'")?.v;
 	}
 
-	private setEmbedder(value: string): void {
-		this.db.prepare("INSERT INTO meta (k, v) VALUES ('embedder', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(value);
+	private setMeta(k: string, v: string): void {
+		this.db.prepare("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(k, v);
 	}
 
 	count(): number {
-		return Number(asRow<{ n: number | bigint }>(this.db.prepare("SELECT COUNT(*) AS n FROM memories").get())?.n ?? 0);
+		return Number(this.one<{ n: number | bigint }>("SELECT COUNT(*) AS n FROM memories")?.n ?? 0);
 	}
 
 	/**
 	 * Vectors are comparable only within one embedding model, and the same model varies slightly
 	 * across runs — so the model name is the truth, never vector comparison. When it differs from
 	 * the configured model, every embedding is regenerated.
+	 *
+	 * Runs at most once per store instance, which is once per pi session: the check costs an
+	 * embedding round trip and its answer cannot change mid-session. A failure leaves the flag unset,
+	 * so the next call tries again rather than silently searching mismatched vectors.
 	 */
-	private async ensureEmbeddings(): Promise<void> {
+	private async ensureEmbeddings(signal?: AbortSignal): Promise<void> {
+		if (this.vectorsChecked) return;
 		const model = resolveSettings().model;
-		const [gvec] = await embed([GOLDEN_TEXT]);
-		const storedGolden = asRow<{ v: string }>(this.db.prepare("SELECT v FROM meta WHERE k = 'golden'").get());
-		let goldenMismatch = true;
-		if (storedGolden) {
-			try {
-				const parsed = JSON.parse(storedGolden.v) as { vec: number[] };
-				goldenMismatch = cosine(gvec, new Float32Array(parsed.vec)) < 0.999;
-			} catch {
-				goldenMismatch = true;
-			}
+		const [golden] = await embed([GOLDEN_TEXT], signal);
+		if (this.embedder() !== model || this.goldenDrifted(golden)) {
+			const rows = this.all<{ id: string; body: Uint8Array }>("SELECT id, body FROM memories");
+			const vectors = await embed(rows.map((row) => this.decode(row.body)), signal);
+			// Vectors only: re-embedding is not an edit, and updated_at is rendered as authorship.
+			const update = this.db.prepare("UPDATE memories SET emb = ? WHERE id = ?");
+			this.transaction(() => {
+				rows.forEach((row, i) => update.run(toBlob(vectors[i]), row.id));
+				this.setMeta("embedder", model);
+				this.setMeta("golden", JSON.stringify({ text: GOLDEN_TEXT, vec: Array.from(golden) }));
+			});
 		}
-		if (this.embedder() === model && !goldenMismatch) {
-			// still refresh golden? no
-			return;
+		this.vectorsChecked = true;
+	}
+
+	/** A stored golden vector that no longer reproduces means the model moved underneath its own name. */
+	private goldenDrifted(golden: Float32Array): boolean {
+		const stored = this.one<{ v: string }>("SELECT v FROM meta WHERE k = 'golden'");
+		if (!stored) return true;
+		try {
+			const { vec } = JSON.parse(stored.v) as { vec: number[] };
+			return cosine(golden, new Float32Array(vec)) < 0.999;
+		} catch {
+			return true;
 		}
-		const rows = asRows<{ id: string; body: Uint8Array }>(this.db.prepare("SELECT id, body FROM memories").all());
-		const vectors = await embed(rows.map((row) => this.decode(row.body)));
-		const update = this.db.prepare("UPDATE memories SET emb = ?, dim = ?, updated_at = ? WHERE id = ?");
-		const now = Date.now();
+	}
+
+	/**
+	 * A read-only store's vectors belong to whoever seeded it, so regenerating them is not an option:
+	 * a model mismatch is reported and the store is skipped instead.
+	 */
+	private assertVectorsComparable(): void {
+		const written = this.embedder();
+		const model = resolveSettings().model;
+		if (written && written !== model) {
+			throw new Error(
+				`${this.dir} was embedded with "${written}" but this session uses "${model}", and vectors from ` +
+					`different models are not comparable. Re-seed it with "${model}" to search it.`,
+			);
+		}
+	}
+
+	/** Every mutation goes through here: a read-only store is searched, never written. */
+	private assertWritable(): void {
+		if (this.readOnly) throw new Error(`${this.dir} is a read-only store; only the local store takes writes.`);
+	}
+
+	/** Runs `body` in one transaction, so a batch is all-or-nothing rather than half-applied. */
+	private transaction<T>(body: () => T): T {
 		this.db.exec("BEGIN");
 		try {
-			rows.forEach((row, i) => update.run(toBlob(vectors[i]), vectors[i].length, now, row.id));
-			this.setEmbedder(model);
-			this.db.prepare("INSERT INTO meta (k, v) VALUES ('golden', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(JSON.stringify({ text: GOLDEN_TEXT, vec: Array.from(gvec) }));
+			const out = body();
 			this.db.exec("COMMIT");
+			return out;
 		} catch (err) {
 			this.db.exec("ROLLBACK");
 			throw err;
 		}
 	}
 
-	async create(texts: string[], sessionId: string): Promise<Array<{ id: string; text: string }>> {
+	async create(texts: string[], sessionId: string, signal?: AbortSignal): Promise<Array<{ id: string; text: string }>> {
+		this.assertWritable();
 		const clean = texts.map((t) => t.trim()).filter((t) => t.length > 0);
 		if (clean.length === 0) return [];
-		await this.ensureEmbeddings();
-		const vectors = await embed(clean);
+		await this.ensureEmbeddings(signal);
+		const vectors = await embed(clean, signal); // one HTTP round trip for the whole batch
 		const now = Date.now();
 		const insert = this.db.prepare(
-			"INSERT INTO memories (id, body, emb, dim, score, sessions, created_at, updated_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+			"INSERT INTO memories (id, body, emb, score, sessions, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
 		);
-		const created: Array<{ id: string; text: string }> = [];
-		this.db.exec("BEGIN");
-		try {
+		return this.transaction(() => {
+			const created: Array<{ id: string; text: string }> = [];
 			for (let i = 0; i < clean.length; i++) {
-				const id = this.newId("memories");
-				insert.run(id, this.encode(clean[i]), toBlob(vectors[i]), vectors[i].length, JSON.stringify([sessionId]), now, now);
+				const id = this.newId();
+				insert.run(id, this.encode(clean[i]), toBlob(vectors[i]), JSON.stringify([sessionId]), now, now);
 				created.push({ id, text: clean[i] });
 			}
-			this.db.exec("COMMIT");
-		} catch (err) {
-			this.db.exec("ROLLBACK");
-			throw err;
-		}
-		return created;
+			return created;
+		});
 	}
 
-	async edit(items: Array<{ id: string; text: string }>, sessionId: string): Promise<string[]> {
+	async edit(items: Array<{ id: string; text: string }>, sessionId: string, signal?: AbortSignal): Promise<string[]> {
+		this.assertWritable();
+		// Every id is checked before anything is written, so a bad one cannot leave a half-applied batch.
 		const rows = items.map((item) => {
 			const row = this.findById(item.id);
 			if (!row) throw new Error(`edit: no memory with id "${item.id}".`);
@@ -442,33 +559,40 @@ export class MemoryStore {
 			if (!text) throw new Error(`edit: replacement text for "${item.id}" was empty.`);
 			return { row, text };
 		});
-		const vectors = await embed(rows.map((r) => r.text)); // one HTTP round trip for the whole batch
-		const update = this.db.prepare("UPDATE memories SET body = ?, emb = ?, dim = ?, sessions = ?, updated_at = ? WHERE id = ?");
-		rows.forEach(({ row, text }, i) => {
-			const stamps = parseStamps(row.sessions);
-			const chain = stamps[stamps.length - 1] === sessionId ? stamps : [...stamps, sessionId];
-			update.run(this.encode(text), toBlob(vectors[i]), vectors[i].length, JSON.stringify(chain), Date.now(), row.id);
+		const vectors = await embed(rows.map((r) => r.text), signal); // one HTTP round trip for the whole batch
+		const update = this.db.prepare("UPDATE memories SET body = ?, emb = ?, sessions = ?, updated_at = ? WHERE id = ?");
+		return this.transaction(() => {
+			rows.forEach(({ row, text }, i) => {
+				const stamps = parseStamps(row.sessions);
+				const chain = stamps[stamps.length - 1] === sessionId ? stamps : [...stamps, sessionId];
+				update.run(this.encode(text), toBlob(vectors[i]), JSON.stringify(chain), Date.now(), row.id);
+			});
+			return rows.map((r) => r.row.id);
 		});
-		return rows.map((r) => r.row.id);
 	}
 
 	delete(ids: string[]): string[] {
-		const stmt = this.db.prepare("DELETE FROM memories WHERE id = ?");
-		for (const id of ids) {
-			if (!this.findById(id)) throw new Error(`delete: no memory with id "${id}".`);
-			stmt.run(id);
+		this.assertWritable();
+		const missing = ids.filter((id) => !this.findById(id));
+		if (missing.length) {
+			throw new Error(`delete: no memory with id ${missing.map((id) => `"${id}"`).join(", ")}.`);
 		}
-		return ids;
+		const stmt = this.db.prepare("DELETE FROM memories WHERE id = ?");
+		return this.transaction(() => {
+			for (const id of ids) stmt.run(id);
+			return ids;
+		});
 	}
-
 
 	/** true moves a memory up future rankings, false sinks it toward silt. */
 	vote(items: Array<{ id: string; helpful: boolean }>): Array<{ id: string; delta: number; missing: boolean }> {
+		this.assertWritable();
 		const out: Array<{ id: string; delta: number; missing: boolean }> = [];
 		const bump = this.db.prepare("UPDATE memories SET score = score + ?, updated_at = ? WHERE id = ?");
 		for (const item of items) {
 			const row = this.findById(item.id);
 			const delta = item.helpful ? VOTE_STEP : -VOTE_STEP;
+			// An unknown id is reported, not thrown: ratings arrive from earlier sessions and may be stale.
 			if (!row) {
 				out.push({ id: item.id, delta, missing: true });
 				continue;
@@ -480,37 +604,25 @@ export class MemoryStore {
 	}
 
 	/** Explicitly switch encryption mode. Generates a key on first switch to encrypted. */
-	async switchEncryption(target: boolean): Promise<void> {
+	switchEncryption(target: boolean): void {
+		this.assertWritable();
 		if (target === this.encrypted) return;
-		const keyPath = path.join(this.dir, "memory.key");
-		let key: Buffer | null = this.key;
-		if (target && !key) {
-			key = crypto.randomBytes(32);
-			fs.writeFileSync(keyPath, key, { mode: 0o600 });
-			fs.chmodSync(keyPath, 0o600);
-		}
-		if (!key && target) throw new Error("Could not obtain encryption key.");
-		const k = key as Buffer;
-		this.db.exec("BEGIN");
-		try {
-			const rewrite = (table: string) => {
-				const rows = this.db.prepare(`SELECT id, body FROM ${table}`).all() as Array<{ id: string; body: Uint8Array }>;
-				const upd = this.db.prepare(`UPDATE ${table} SET body = ? WHERE id = ?`);
-				for (const r of rows) {
-					const buf = Buffer.from(r.body.buffer, r.body.byteOffset, r.body.byteLength);
-					const text = this.encrypted ? decrypt(k, buf) : buf.toString("utf8");
-					upd.run(target ? encrypt(k, text) : Buffer.from(text, "utf8"), r.id);
-				}
-			};
-			rewrite("memories");
-			this.db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(String(target));
-			this.db.exec("COMMIT");
-		} catch (e) {
-			this.db.exec("ROLLBACK");
-			throw e;
-		}
+		// Switching on with no key yet: generate it first, so a failed rewrite leaves the store as it
+		// was and the key is already on disk for the retry.
+		const key = this.key ?? crypto.randomBytes(32);
+		if (!this.key) writeKey(path.join(this.dir, "memory.key"), key);
+		const wasEncrypted = this.encrypted;
+		this.transaction(() => {
+			const rows = this.all<{ id: string; body: Uint8Array }>("SELECT id, body FROM memories");
+			const update = this.db.prepare("UPDATE memories SET body = ? WHERE id = ?");
+			for (const row of rows) {
+				const text = wasEncrypted ? decrypt(key, row.body) : Buffer.from(row.body).toString("utf8");
+				update.run(target ? encrypt(key, text) : Buffer.from(text, "utf8"), row.id);
+			}
+			this.setMeta("encrypted", String(target));
+		});
 		this.encrypted = target;
-		this.key = target ? k : null;
+		this.key = target ? key : null;
 	}
 
 	private encode(text: string): Buffer {
@@ -525,19 +637,16 @@ export class MemoryStore {
 	}
 
 	private findById(id: string): MemoryRow | undefined {
-		return asRow<MemoryRow>(
-			this.db.prepare("SELECT id, body, emb, score, sessions FROM memories WHERE id = ?").get(id),
-		);
+		return this.one<MemoryRow>("SELECT id, body, emb, score, sessions FROM memories WHERE id = ?", id);
 	}
 
-
 	/** Embeds the query, scores every stored memory, decrypts the top-k. */
-	async surface(query: string, limit = TOP_K): Promise<SurfaceResult> {
-		await this.ensureEmbeddings();
-		const [qvec] = await embed([query]);
-		const rows = asRows<MemoryRow>(
-			this.db.prepare("SELECT id, body, emb, score, sessions FROM memories").all(),
-		);
+	async surface(query: string, signal?: AbortSignal): Promise<SurfaceResult> {
+		// A read-only store's vectors are not ours to regenerate, so a model mismatch stops the search.
+		if (this.readOnly) this.assertVectorsComparable();
+		else await this.ensureEmbeddings(signal);
+		const [qvec] = await embed([query], signal);
+		const rows = this.all<MemoryRow>("SELECT id, body, emb, score, sessions FROM memories");
 
 		const ranked: Array<{ row: MemoryRow; similarity: number; rank: number }> = [];
 		let bestMiss = 0;
@@ -552,7 +661,7 @@ export class MemoryStore {
 			ranked.push({ row, similarity, rank: similarity + influence });
 		}
 		ranked.sort((a, b) => b.rank - a.rank);
-		const top = ranked.slice(0, limit);
+		const top = ranked.slice(0, TOP_K);
 
 		const hits: SurfaceHit[] = top.map((t) => {
 			const stamps = parseStamps(t.row.sessions);
@@ -561,6 +670,7 @@ export class MemoryStore {
 				text: this.decode(t.row.body),
 				score: Number(t.row.score.toFixed(2)),
 				similarity: Number(t.similarity.toFixed(4)),
+				rank: Number(t.rank.toFixed(4)),
 				session: stamps[stamps.length - 1],
 				stamps: stamps.length,
 			};
@@ -570,8 +680,14 @@ export class MemoryStore {
 	}
 }
 
+/** A corrupt provenance chain costs one breadcrumb, not the whole surface call. */
 function parseStamps(raw: string): string[] {
-	return JSON.parse(raw) as string[];
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		return Array.isArray(parsed) ? parsed.filter((s): s is string => typeof s === "string") : [];
+	} catch {
+		return [];
+	}
 }
 
 // ── Result formatting ────────────────────────────────────────────────
@@ -582,8 +698,62 @@ interface SurfaceResult {
 	bestMiss: number;
 }
 
-function renderSurface(result: SurfaceResult): string {
-	const lines: string[] = [];
+/** What one configured store contributed: its results, or the reason it could not be searched. */
+interface StoreSurface extends SurfaceResult {
+	name: string;
+	error?: string;
+}
+
+/** Every store's contribution, merged into one ranked list. */
+interface MergedSurface {
+	hits: SurfaceHit[];
+	total: number;
+	bestMiss: number;
+	skipped: Array<{ name: string; error: string }>;
+}
+
+/**
+ * Searches every configured store and merges the hits into one ranking. The local store is this
+ * session's own, so when it fails the call fails: a soft "nothing matched" would hide a dead
+ * credential. An optional store degrades to a note instead, so a broken shared corpus cannot take
+ * the local results down with it.
+ */
+async function searchStores(stores: Stores, query: string, signal?: AbortSignal): Promise<MergedSurface> {
+	const optional: Array<[string, MemoryStore]> = stores.global ? [["global", stores.global]] : [];
+	const settled = await Promise.allSettled([
+		stores.local.surface(query, signal),
+		...optional.map(([, store]) => store.surface(query, signal)),
+	]);
+	const [local, ...rest] = settled;
+	if (local.status === "rejected") throw local.reason;
+	const perStore: StoreSurface[] = [
+		{ name: "local", ...local.value },
+		...rest.map((outcome, i): StoreSurface =>
+			outcome.status === "fulfilled"
+				? { name: optional[i][0], ...outcome.value }
+				: { name: optional[i][0], hits: [], total: 0, bestMiss: 0, error: (outcome.reason as Error).message },
+		),
+	];
+	// One ranking rule whatever the store count: `rank` already carries the helpfulness influence, so
+	// merging on it preserves the order a single store would have produced.
+	const merged = perStore
+		.flatMap((s) => s.hits.map((hit) => ({ ...hit, store: s.name })))
+		.sort((a, b) => b.rank - a.rank)
+		.slice(0, TOP_K);
+	// Naming the store tells the model where a memory came from, but with one store it is noise on
+	// every line — so it is added only when there is more than one to tell apart.
+	const contributors = new Set(perStore.filter((s) => s.hits.length > 0).map((s) => s.name));
+	return {
+		hits: merged.map(({ store, ...hit }) => (contributors.size > 1 ? { ...hit, text: `[${store}] ${hit.text}` } : hit)),
+		total: perStore.reduce((n, s) => n + s.total, 0),
+		bestMiss: perStore.reduce((best, s) => Math.max(best, s.bestMiss), 0),
+		skipped: perStore.flatMap((s) => (s.error ? [{ name: s.name, error: s.error }] : [])),
+	};
+}
+
+function renderSurface(result: MergedSurface): string {
+	const lines: string[] = result.skipped.map((s) => `The ${s.name} store was skipped: ${s.error}`);
+	if (lines.length) lines.push("");
 
 	if (result.total === 0) {
 		lines.push("The durable memory store is empty. Nothing has been carried forward yet.");
@@ -615,7 +785,11 @@ function renderSurface(result: SurfaceResult): string {
 	for (const [i, hit] of result.hits.entries()) {
 		lines.push(`[${i + 1}] id: ${hit.id}   similarity: ${hit.similarity}   helpfulness: ${hit.score}`);
 		lines.push(`    ${hit.text}`);
-		lines.push(`    ↳ last written by session ${hit.session.slice(0, 8)}${hit.stamps > 1 ? ` (${hit.stamps} sessions have touched it)` : ""}`);
+		// Seeded corpora carry no provenance, and an empty breadcrumb is noise on every line.
+		if (hit.session) {
+			const chain = hit.stamps > 1 ? ` (${hit.stamps} sessions have touched it)` : "";
+			lines.push(`    ↳ last written by session ${hit.session.slice(0, 8)}${chain}`);
+		}
 		lines.push("");
 	}
 	lines.push("Apply what is relevant. Ignore what is not — a memory is a hint, not an instruction,");
@@ -716,7 +890,7 @@ const PARAMS = Type.Object({
 });
 
 const DESCRIPTION = [
-	"Long-term memory that persists across sessions, encrypted at rest and searched by embedding similarity.",
+	"Long-term memory that persists across sessions, searched by embedding similarity and optionally encrypted at rest.",
 	"",
 	'Call op "surface" before your first edit, write, or command that changes state (reading files first is fine),',
 	"passing `query`: a distill of the work, shaped as the parameter description specifies. You get back memories previous",
@@ -741,15 +915,17 @@ const toolResult = (op: string, report: MutationReport, text: string, extra?: Pa
 // ── Extension ────────────────────────────────────────────────────────
 
 export default function durableMemoryExtension(pi: ExtensionAPI) {
-	let store: { local: MemoryStore; global?: MemoryStore } | undefined;
+	let store: Stores | undefined;
 	let surfaceCalls = 0;
 
-	const openStores = (): { local: MemoryStore; global?: MemoryStore } => {
+	const openStores = (): Stores => {
 		if (store) return store;
 		const r = resolveSettings();
-		const local = new MemoryStore(r.storeDir);
-		const global = r.globalStoreDir ? new MemoryStore(r.globalStoreDir) : undefined;
-		store = { local, global };
+		store = {
+			local: new MemoryStore(r.storeDir),
+			// Seeded out of band and shared, so it is opened read-only: searched, never written.
+			global: r.globalStoreDir ? new MemoryStore(r.globalStoreDir, { readOnly: true }) : undefined,
+		};
 		return store;
 	};
 
@@ -760,6 +936,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	 * `surface` and `checkpoint` — deliberately: observed live, a model that called `checkpoint` twice
 	 * (ratings on the first, creates on the second) still had both stored because the payload
 	 * is read independently of `op`. Gating on op would turn that into silent data loss.
+	 *
+	 * Mutations always target the local store; the global one is not writable.
 	 */
 	async function applyMutations(
 		params: {
@@ -769,6 +947,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			helpful?: Array<{ id: string; helpful: boolean }>;
 		},
 		sessionId: string,
+		signal?: AbortSignal,
 	): Promise<MutationReport> {
 		const hasAny =
 			params.delete?.length || params.edit?.length || params.create?.length || params.helpful?.length;
@@ -777,8 +956,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		const db = openStore();
 		const report = emptyReport();
 		if (params.delete?.length) report.deleted = db.delete(params.delete);
-		if (params.edit?.length) report.edited = await db.edit(params.edit, sessionId);
-		if (params.create?.length) report.created = await db.create(params.create, sessionId);
+		if (params.edit?.length) report.edited = await db.edit(params.edit, sessionId, signal);
+		if (params.create?.length) report.created = await db.create(params.create, sessionId, signal);
 		if (params.helpful?.length) report.votes = db.vote(params.helpful);
 		return report;
 	}
@@ -787,13 +966,13 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		name: "durable_memory",
 		label: "Durable Memory",
 		description: DESCRIPTION,
-		promptSnippet: "Encrypted cross-session memory; surface early and often, close out each task",
+		promptSnippet: "Cross-session memory; surface early and often, close out each task",
 		promptGuidelines: [
 			"If you have not yet called `durable_memory` with `op: \"surface\"` in this conversation, call it before your " +
-				"first edit, write, or command that changes state. Reading files first is fine and expected — surface " +
-				"before you act, not before you look. Check your own transcript for a previous `durable_memory` call " +
-				"rather than judging whether you feel oriented — a task that needs no orientation is exactly the one " +
-				"where the check is skipped.",
+				"first edit, write, or command that changes state. Reading files first and speaking with the user is fine " +
+				"and expected — surface before you act, not before you look. Check your own transcript for a previous " +
+				"`durable_memory` call rather than judging whether you feel oriented — a task that needs no orientation is " +
+				"exactly the one where the check is skipped.",
 			"Surface is not a one-time check — it is a habit across the session. Call `durable_memory` with " +
 				'`op: "surface"` again whenever the work pivots to a different subsystem, file, or mechanism than the ' +
 				"one you last surfaced for, and whenever a new task begins. An earlier surface may not cover the new " +
@@ -808,7 +987,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			if (signal?.aborted) throw new Error("durable_memory call was aborted.");
 			const sessionId = ctx.sessionManager.getSessionId();
 
-			const report = await applyMutations(params, sessionId);
+			const report = await applyMutations(params, sessionId, signal);
 			// A mutation op that applied nothing is a malformed call — reject it, don't render it.
 			if (params.op !== "surface" && params.op !== "checkpoint" && !hasMutations(report)) {
 				throw new Error(
@@ -824,17 +1003,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			if (params.op === "surface") {
 				const query = params.query?.trim();
 				if (!query) throw new Error('op "surface" requires `query`: a distill of the work (one to three sentences).');
-				const stores = openStores();
-				const results = await Promise.all(Object.entries(stores).filter(([, s]) => !!s).map(async ([name, s]) => ({ name, result: await s!.surface(query) })));
-				// merge ranked hits across stores by rank-ish: concatenate top lists, sort by similarity, slice
-				const mergedHits: SurfaceHit[] = [];
-				for (const { name, result } of results) {
-					for (const h of result.hits) mergedHits.push({ ...h, text: `[${name}] ${h.text}` });
-				}
-				// keep top K by similarity
-				mergedHits.sort((a, b) => b.similarity - a.similarity);
-				const top = mergedHits.slice(0, TOP_K);
-				const merged: SurfaceResult = { hits: top, total: results.reduce((n, r) => n + r.result.total, 0), bestMiss: Math.max(...results.map((r) => r.result.bestMiss), 0) };
+				const merged = await searchStores(openStores(), query, signal);
 				surfaceCalls++;
 
 				const lines = [renderSurface(merged)];
@@ -848,22 +1017,25 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 	pi.registerTool(tool);
 
-	const statusText = (ctx: { sessionManager: { getSessionId(): string } }): string => {
+	const statusText = (ctx: ExtensionContext): string => {
 		try {
 			const r = resolveSettings();
-			const db = openStore();
-			const g = openStores().global;
-			const text = [
-				`memories:  ${db.count()}${g ? ` (local) + ${g.count()} (global)` : ""}`,
-				`store:     ${db.dir}`,
+			const { local, global } = openStores();
+			const lines = [
+				`memories:  ${local.count()}${global ? ` local + ${global.count()} global` : ""}`,
+				`store:     ${local.dir}`,
+			];
+			if (global) lines.push(`global:    ${global.dir} (read-only)`);
+			lines.push(
 				`settings:  ${CONFIG_PATH}`,
-				`endpoint:  ${r.endpoint} · ${r.model} @ ${r.url}`,
+				`endpoint:  ${r.endpoint} · ${r.model} @ ${r.url}${r.urlOverridden ? " (overridden)" : ""}`,
 				`auth key:  ${r.keySource}`,
-				`vectors:   ${db.embedder() ?? "none written yet"}`,
+				`vectors:   ${local.embedder() ?? "none written yet"}`,
+				`encrypted: ${local.encrypted ? "yes" : "no"} (local store)`,
 				`session:   ${ctx.sessionManager.getSessionId()}`,
 				`this session: ${surfaceCalls} surface call${surfaceCalls === 1 ? "" : "s"}`,
-			].join("\n");
-			return text;
+			);
+			return lines.join("\n");
 		} catch (err) {
 			return `durable memory unavailable: ${(err as Error).message}`;
 		}
@@ -875,12 +1047,12 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			const s = readSettings();
 			const r = resolveSettings();
 			const rows: Array<[Key | "status" | "done" | "encrypt", string]> = [
-				["endpoint", `Endpoint        ${r.endpoint} — ${r.url}`],
-				["url", `URL             ${r.url}`],
+				["endpoint", `Endpoint        ${r.endpoint}`],
+				["url", `URL             ${r.url}${r.urlOverridden ? " (overridden)" : ""}`],
 				["model", `Embedding model ${r.model}`],
 				["apiKey", `Auth key        ${r.apiKey ? `set (…${r.apiKey.slice(-4)})` : "not set"}`],
 				["storeDir", `Database dir    ${r.storeDir}`],
-				["encrypt", `Encryption     ${openStore().encrypted ? "encrypted" : "unencrypted"} (local)`],
+				["encrypt", `Encryption      ${openStore().encrypted ? "encrypted" : "unencrypted"} (local)`],
 				["status", "Show status"],
 				["done", "Done"],
 			];
@@ -889,12 +1061,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			if (!key || key === "done") return;
 			if (key === "encrypt") {
 				const db = openStore();
-				const target = !db.encrypted;
-				if (target && !fs.existsSync(path.join(db.dir, "memory.key"))) {
-					// generate on switchover
-				}
 				try {
-					await db.switchEncryption(target);
+					db.switchEncryption(!db.encrypted); // generates the keyfile on the first switch to encrypted
 					ctx.ui.notify(`Local store is now ${db.encrypted ? "encrypted" : "unencrypted"}.`, "info");
 				} catch (err) {
 					ctx.ui.notify((err as Error).message, "error");
@@ -908,19 +1076,20 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			}
 
 			if (key === "endpoint") {
-				const chosen = await ctx.ui.select("Embeddings run on", [
-					`remote — hosted (${URLS.remote})`,
-					`local — this machine (${URLS.local})`,
-				]);
-				if (!chosen) continue;
-				const endpoint: Endpoint = chosen.startsWith("local") ? "local" : "remote";
-				writeSettings({ ...s, endpoint, url: URLS[endpoint] }); // the preset carries its URL
+				// A picker, nothing more: the URL is the chosen endpoint's preset unless the URL row overrides it.
+				const picked = await ctx.ui.select("Embeddings run on", [...ENDPOINTS]);
+				if (!picked) continue;
+				const { url: _previousUrl, ...rest } = s;
+				writeSettings({ ...rest, endpoint: picked as Endpoint });
+				ctx.ui.notify(`Embeddings endpoint is now ${picked}.`, "info");
 				continue;
 			}
 
 			if (key === "url") {
-				const typed = await ctx.ui.input("Embeddings URL (blank restores the endpoint's)", r.url);
-				if (typed !== undefined) writeSettings({ ...s, url: typed.trim() || URLS[s.endpoint ?? "remote"] });
+				const typed = await ctx.ui.input(`Embeddings URL (blank restores the ${r.endpoint} preset)`, r.url);
+				if (typed === undefined) continue;
+				// Blank clears the override, so the endpoint's preset takes over again.
+				writeSettings({ ...s, url: typed.trim() || undefined });
 				continue;
 			}
 
@@ -949,24 +1118,32 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("durable-memory", {
 		description: "Durable memory: configure endpoint, auth key, and database directory: /durable-memory",
 		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-			if (arg === "status" || !ctx.hasUI) {
-				ctx.ui.notify(statusText(ctx), "info");
+			if (args.trim().toLowerCase() !== "status" && ctx.hasUI) {
+				await runSettings(ctx);
 				return;
 			}
-			await runSettings(ctx);
+			// Without a dialog-capable UI (`pi --print`, `pi --json`) there is no menu to run, and
+			// `ui.notify` is a no-op there. stdout belongs to the run's own output, so status goes to stderr.
+			const text = statusText(ctx);
+			if (ctx.hasUI) ctx.ui.notify(text, "info");
+			else process.stderr.write(`${text}\n`);
 		},
 	});
 
-	pi.on("session_start", () => {
-		surfaceCalls = 0;
-	});
-
-	pi.on("session_shutdown", () => {
+	// Stores are per-session, not per-process: dropping them here is what makes the embedding check
+	// run once per session, and it lets a session pick up settings edited since the last one started.
+	const closeStores = (): void => {
 		store?.local.close();
 		store?.global?.close();
 		store = undefined;
+	};
+
+	pi.on("session_start", () => {
+		surfaceCalls = 0;
+		closeStores();
 	});
+
+	pi.on("session_shutdown", closeStores);
 }
 
 export { DEFAULT_STORE_DIR, CONFIG_PATH, resolveSettings, readSettings };

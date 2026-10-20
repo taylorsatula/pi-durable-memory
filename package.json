@@ -1,7 +1,7 @@
 {
   "name": "@taylorsatula/pi-durable-memory",
-  "version": "0.3.4",
-  "description": "Encrypted, embedding-searched long-term memory for pi, with a surface/finish attention-sink loop",
+  "version": "0.3.5",
+  "description": "Embedding-searched long-term memory for pi, with a surface/checkpoint attention-sink loop",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -13,6 +13,10 @@
   "license": "MIT",
   "author": "Taylor Satula",
   "type": "module",
+  "scripts": {
+    "test": "node bench/probe.mjs",
+    "prepublishOnly": "node bench/probe.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/taylorsatula/pi-durable-memory.git"

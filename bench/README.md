@@ -7,7 +7,7 @@ measurements, not guesses, and this directory is how they get re-measured.
 
 | File | Purpose |
 |---|---|
-| `probe.mjs` | Functional witness. Loads the real extension through jiti, drives `durable_memory` end to end — encryption at rest, session stamping, batching, failure paths, retrieval accuracy — against a scratch copy so the operator's `memory.db` is never touched. |
+| `probe.mjs` | Functional witness. Loads the real extension through jiti, drives `durable_memory` end to end — opt-in encryption, session stamping, batching, failure paths, the two-store merge, retrieval accuracy — against a scratch copy so the operator's `memory.db` is never touched. Also the `prepublishOnly` gate: a publish runs it first. |
 | `run.mjs` | Retrieval benchmark. Embeds a corpus once (cached), then sweeps the cosine floor and K, reporting recall, MRR, off-topic leakage, and the maximum-margin floor. |
 | `digest.mjs` | Compresses one pi session JSONL into a readable transcript, for harvesting a corpus. |
 | `neg.json` | Twelve off-topic control queries. Nothing in the corpus relates to them; a floor that lets one through is too low. |

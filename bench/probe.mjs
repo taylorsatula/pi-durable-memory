@@ -12,6 +12,7 @@
  *
  * Usage: node bench/probe.mjs
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -62,14 +63,18 @@ delete process.env.DURABLE_MEMORY_DIR;
 // The extension takes its credential from env or its config file only. Source a real key into
 // env — from the operator's durable-memory config, or pi's auth.json — and never symlink the
 // whole config, which also names the operator's real store.
+/** Assigning undefined to process.env stores the string "undefined", so only ever set a real value. */
+const setEnv = (name, value) => {
+	if (typeof value === "string" && value) process.env[name] = value;
+};
 if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
 	const realCfg = path.join(os.homedir(), ".pi", "agent", "durable-memory", "config.json");
-	if (fs.existsSync(realCfg)) process.env.DURABLE_MEMORY_EMBED_KEY = JSON.parse(fs.readFileSync(realCfg, "utf8")).apiKey;
+	if (fs.existsSync(realCfg)) setEnv("DURABLE_MEMORY_EMBED_KEY", JSON.parse(fs.readFileSync(realCfg, "utf8")).apiKey);
 	if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
 		try {
 			const provider = process.env.DURABLE_MEMORY_EMBED_PROVIDER ?? "lunaroute";
 			const entry = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "auth.json"), "utf8"))[provider];
-			process.env.DURABLE_MEMORY_EMBED_KEY = entry?.key ?? entry?.access;
+			setEnv("DURABLE_MEMORY_EMBED_KEY", entry?.key ?? entry?.access);
 		} catch {}
 	}
 }
@@ -126,10 +131,10 @@ check("hooks session_start and session_shutdown", (captured.handlers.get("sessio
 check("contributes a promptSnippet for the tool list", typeof tool.promptSnippet === "string" && tool.promptSnippet.length > 0);
 const guides = (tool.promptGuidelines ?? []).join("\n");
 check("guideline makes the surface trigger transcript-checkable", /have not yet called/i.test(guides) && /Check your own transcript/i.test(guides) && /op: "surface"/.test(guides), guides);
-check("guideline makes the checkpoint trigger transcript-checkable", /have not called `durable_memory` with `op: "checkpoint"` since completing it/i.test(guides), guides);
-check("guideline asks for the surrounding-work second part", /The surrounding work:/i.test(guides), guides);
+check("guideline makes the checkpoint trigger transcript-checkable", /Check your transcript for a `checkpoint` call after that task or commit/i.test(guides), guides);
 check("schema exposes all six ops", ["surface", "checkpoint", "create", "edit", "delete", "helpful"].every((o) => JSON.stringify(tool.parameters).includes(o)));
-check("description asks for the surrounding-work second part", /The surrounding work:/i.test(tool.description));
+check("the query parameter asks for the surrounding-work second part", /The surrounding work:/i.test(JSON.stringify(tool.parameters)));
+check("the description says encryption is optional, not assumed", /optionally encrypted/i.test(tool.description), tool.description.slice(0, 140));
 
 await fire("session_start");
 
@@ -145,7 +150,7 @@ check("byte-identical across calls and sessions", textOf(f1) === textOf(f2));
 check("carries the attention marker", textOf(f1).includes("⟁"));
 check("instructs create", /`create`/.test(textOf(f1)));
 check("instructs rating every surfaced id", /rate every id you were shown by `surface`/i.test(textOf(f1)), textOf(f1).slice(0, 300));
-check("scopes the closeout to a completed task, not the session", /You just completed a task/i.test(textOf(f1)));
+check("scopes the closeout to a completed task, not the session", /You just completed a unit of work/i.test(textOf(f1)));
 check("says it is repeatable within a session", /call `checkpoint` again/i.test(textOf(f1)));
 check("does not presuppose the session is ending", !/drawing to a close/i.test(textOf(f1)));
 check("instructs one batched call", /ONE `durable_memory` call/i.test(textOf(f1)));
@@ -207,9 +212,9 @@ if (!corpus) {
 	const t = textOf(sample);
 	check("results render numbered with id, similarity, helpfulness", /\[1\] id: [0-9a-f]{8}\s+similarity: [\d.]+\s+helpfulness: [-\d.]+/.test(t), t.slice(0, 200));
 	check("results are capped at 8", (sample.details.hits ?? []).length <= 8);
-	check("similarity descends within the top-k", (sample.details.hits ?? []).every((h, i, a) => i === 0 || a[i - 1].similarity >= h.similarity));
+	check("rank descends within the top-k", (sample.details.hits ?? []).every((h, i, a) => i === 0 || a[i - 1].rank >= h.rank), JSON.stringify((sample.details.hits ?? []).map((h) => [h.rank, h.similarity])));
 	check("carries the strongly worded checkpoint reminder", /DO NOT DEFER IT TO THE END/.test(t) && /DO NOT SKIP IT/.test(t), t.slice(-400));
-check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET OUT TO DO IS COMPLETE/.test(t) && /EVEN IF THE SESSION CONTINUES/.test(t));
+	check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET OUT TO DO IS COMPLETE/.test(t) && /DO NOT DEFER IT TO THE END/.test(t) && !/when the session ends/i.test(t), t.slice(-400));
 	check("offers a re-surface naming different machinery", /different machinery/.test(t));
 	check("states that the repository outranks a memory", /repository in front of you outranks it/.test(t));
 	check("details expose the provenance stamp", (sample.details.hits ?? []).every((h) => typeof h.session === "string" && h.stamps >= 1));
@@ -259,16 +264,57 @@ check("the reminder is task-scoped, not session-scoped", /WHEN THE TASK YOU SET 
 }
 
 // ── 6. encryption at rest ────────────────────────────────────────────
-section("[6] memory bodies are ciphertext at rest");
-const db = new DatabaseSync(DB, { readOnly: true });
-const rows = db.prepare("SELECT id, body, emb FROM memories").all();
-db.close();
+section("[6] encryption is opt-in, and switching it on round-trips every body");
+const { MemoryStore } = mod;
+const readRows = () => {
+	const handle = new DatabaseSync(DB, { readOnly: true });
+	try {
+		return handle.prepare("SELECT id, body, emb FROM memories").all();
+	} finally {
+		handle.close();
+	}
+};
+const readMeta = (k) => {
+	const handle = new DatabaseSync(DB, { readOnly: true });
+	try {
+		return handle.prepare("SELECT v FROM meta WHERE k = ?").get(k)?.v;
+	} finally {
+		handle.close();
+	}
+};
+const needle = /mira|Taylor|banana|sqlite|embedding|memory|encrypted|pi extension|vault combination/i;
+const readable = (rs) => rs.filter((r) => needle.test(Buffer.from(r.body).toString("latin1")));
+
+await call({ op: "create", create: ["The vault combination lives only in the operator's head."] });
+let rows = readRows();
 check("rows exist", rows.length > 0, String(rows.length));
 check("all vectors are 1024-dim emb-qwen3", rows.every((r) => Buffer.from(r.emb).length === 4096), String(rows[0] && Buffer.from(rows[0].emb).length));
-const needle = /mira|Taylor|banana|sqlite|embedding|memory|encrypted|pi extension/i;
-const leakedRows = rows.filter((r) => needle.test(Buffer.from(r.body).toString("latin1")));
-check("no plaintext survives in any stored body", leakedRows.length === 0, `${leakedRows.length} rows leaked`);
+check("unencrypted by default", readMeta("encrypted") === "false", String(readMeta("encrypted")));
+check("so by default the bodies are plaintext", readable(rows).length > 0, "no plaintext body found — the default has changed");
+check("and no keyfile exists yet", !fs.existsSync(KEY));
+
+// The operator path: the Encryption row of /durable-memory, which flips the mode on the very instance
+// the tool uses. Flipping it behind the extension's back would desync the cached store from the file.
+const encryptCtx = {
+	...ctx,
+	ui: {
+		...ctx.ui,
+		select: (() => {
+			let n = 0;
+			return async (_t, options) => (++n === 1 ? options.find((o) => o.startsWith("Encryption")) : options[options.length - 1]);
+		})(),
+		input: async () => undefined,
+	},
+};
+await captured.commands.get("durable-memory").handler("", encryptCtx);
+rows = readRows();
+check("switching on encrypts every body", readable(rows).length === 0, `${readable(rows).length} rows still readable`);
 check("every body is iv(12) + tag(16) + ciphertext", rows.every((r) => Buffer.from(r.body).length > 28));
+check("the mode is recorded in meta", readMeta("encrypted") === "true", String(readMeta("encrypted")));
+check("the operator is told the new mode", /now encrypted/.test(notices[notices.length - 1]?.text ?? ""), notices[notices.length - 1]?.text ?? "no notice");
+check("vectors stay in the clear, since encrypted content cannot be searched", rows.every((r) => Buffer.from(r.emb).length === 4096));
+const roundTrip = await call({ op: "surface", query: "Where the vault combination is kept. The surrounding work: an operator-only secret and the store that holds it." });
+check("the same memory surfaces as readable text afterwards", /vault combination/i.test(textOf(roundTrip)), textOf(roundTrip).slice(0, 200));
 
 // ── 7. mutations and batching ────────────────────────────────────────
 section("[7] mutations, batching, and the closeout in one call");
@@ -299,11 +345,25 @@ check("score moved down and up respectively", s0 < 0 && s1 > 0, `${s0} / ${s1}`)
 const del = await call({ op: "delete", delete: [newIds[0]] });
 check("delete applied", del.details.report.deleted.length === 1);
 const casc = new DatabaseSync(DB, { readOnly: true });
-const orphan = 0;
 const n1 = Number(casc.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
 casc.close();
-check("deleting a memory cascades to its pointers", Number(orphan) === 0, String(orphan));
 check("row count is net +1 after create 2 / delete 1", n1 === n0 + 1, `${n0} -> ${n1}`);
+
+// A batch with one unknown id must delete nothing: every id is checked before the first write.
+const keeper = await call({ op: "create", create: ["A memory that must survive a failed batch delete."] });
+const keeperId = keeper.details.report.created[0].id;
+let batchErr = null;
+try {
+	await call({ op: "delete", delete: [keeperId, "ffffffff"] });
+} catch (e) {
+	batchErr = e.message;
+}
+const afterBatch = new DatabaseSync(DB, { readOnly: true });
+const n2 = Number(afterBatch.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
+afterBatch.close();
+check("a batch delete naming one unknown id throws", /no memory with id "ffffffff"/.test(batchErr ?? ""), batchErr ?? "no error");
+check("and deleted nothing on the way out", n2 === n1 + 1, `${n1} -> ${n2}`);
+await call({ op: "delete", delete: [keeperId] });
 
 // ── 8. failure paths propagate ───────────────────────────────────────
 section("[8] failure paths propagate instead of returning empty");
@@ -338,7 +398,6 @@ check("key exists and is 32 bytes", fs.statSync(KEY).size === 32);
 check("keyfile mode is 0600", (fs.statSync(KEY).mode & 0o777) === 0o600, (fs.statSync(KEY).mode & 0o777).toString(8));
 const keyBytes = fs.readFileSync(KEY);
 fs.writeFileSync(KEY, Buffer.concat([keyBytes, Buffer.from([0])]));
-const { MemoryStore } = mod;
 let badKey = false;
 try {
 	new MemoryStore(mod.resolveSettings().storeDir);
@@ -383,10 +442,13 @@ fs.rmSync(CONFIG, { force: true });
 const pre = mod.readSettings();
 check(
 	"a missing config prefills the defaults on read",
-	pre.endpoint === "remote" && pre.url === "https://gw.lunaroute.com/v1/embeddings" && pre.model === "emb-qwen3" && pre.storeDir === mod.DEFAULT_STORE_DIR,
+	pre.endpoint === "remote" && pre.model === "emb-qwen3" && pre.storeDir === mod.DEFAULT_STORE_DIR,
 	JSON.stringify(pre),
 );
+check("the prefill names no url, so the endpoint's preset applies", pre.url === undefined, JSON.stringify(pre));
 check("the prefill is written to the file", JSON.parse(fs.readFileSync(CONFIG, "utf8")).model === "emb-qwen3");
+check("the resolved url is the remote preset", mod.resolveSettings().url === "https://gw.lunaroute.com/v1/embeddings", mod.resolveSettings().url);
+check("and is not marked as overridden", mod.resolveSettings().urlOverridden === false);
 const envKey = process.env.DURABLE_MEMORY_EMBED_KEY;
 delete process.env.DURABLE_MEMORY_EMBED_KEY;
 const ALT_DIR = path.join(SCRATCH, "alt-store");
@@ -400,6 +462,7 @@ const s = mod.readSettings();
 check("endpoint is read", s.endpoint === "local");
 const resolved = mod.resolveSettings();
 check("url is read", resolved.url === "http://127.0.0.1:9999/v1/embeddings", resolved.url);
+check("a typed url counts as an override", resolved.urlOverridden === true);
 check("model is read", resolved.model === "local-emb", resolved.model);
 check("apiKey is read from the config", resolved.apiKey === "cfg-secret" && resolved.keySource === "config", resolved.keySource);
 check("storeDir is read", resolved.storeDir === ALT_DIR, resolved.storeDir);
@@ -417,6 +480,10 @@ check("with no file the defaults apply and the file is recreated", (() => {
 	const d = mod.resolveSettings();
 	return d.endpoint === "remote" && d.model === "emb-qwen3" && d.storeDir === mod.DEFAULT_STORE_DIR && fs.existsSync(CONFIG);
 })());
+// A url equal to the endpoint's own preset is the default, not an override — including one left in a
+// config written by an earlier version, which stored the preset explicitly.
+fs.writeFileSync(CONFIG, JSON.stringify({ endpoint: "remote", url: "https://gw.lunaroute.com/v1/embeddings" }), { mode: 0o600 });
+check("a stored preset url is not an override", mod.resolveSettings().urlOverridden === false, JSON.stringify(mod.readSettings()));
 
 // A malformed settings file must fail loudly rather than silently reverting to defaults.
 fs.writeFileSync(CONFIG, "{ not json", { mode: 0o600 });
@@ -457,17 +524,19 @@ const st = NOTICES[NOTICES.length - 1] ?? "";
 check("status reports the endpoint", /endpoint:/.test(st), st);
 check("status reports the auth-key source", /auth key:/.test(st), st);
 
-// Choosing the endpoint writes the file, and the store picks it up with no restart.
+// The endpoint row is a bare picker: no URL on the row, none on the options.
+const seenSelections = [];
 const editCtx = {
 	...settingsCtx,
 	ui: {
 		...settingsCtx.ui,
 		select: (() => {
 			let call = 0;
-			return async (_t, options) => {
+			return async (_title, options) => {
 				call++;
-				if (call === 1) return options[0]; // "Endpoint"
-				if (call === 2) return options[1]; // "local"
+				seenSelections.push(options);
+				if (call === 1) return options.find((o) => o.startsWith("Endpoint"));
+				if (call === 2) return "local";
 				return options[options.length - 1]; // "Done"
 			};
 		})(),
@@ -475,11 +544,61 @@ const editCtx = {
 	},
 };
 await captured.commands.get("durable-memory").handler("", editCtx);
+check(
+	"the endpoint row shows the endpoint and no url",
+	seenSelections[0].includes("Endpoint        remote") && !seenSelections[0].some((o) => o.startsWith("Endpoint") && /https?:/.test(o)),
+	JSON.stringify(seenSelections[0]),
+);
+check(
+	"the url row shows the url that will be used",
+	seenSelections[0].some((o) => o === "URL             https://gw.lunaroute.com/v1/embeddings"),
+	JSON.stringify(seenSelections[0]),
+);
+check("the endpoint picker offers bare names, no urls", JSON.stringify(seenSelections[1]) === JSON.stringify(["remote", "local"]), JSON.stringify(seenSelections[1]));
 const after = mod.readSettings();
 check("choosing local writes endpoint=local", after.endpoint === "local", JSON.stringify(after));
-check("the preset carries its url", after.url === "http://localhost:8080/v1/embeddings", JSON.stringify(after));
-check("the resolved url is the preset", mod.resolveSettings().url === "http://localhost:8080/v1/embeddings", mod.resolveSettings().url);
+check("choosing an endpoint leaves no url behind", after.url === undefined, JSON.stringify(after));
+check("the resolved url is the local preset", mod.resolveSettings().url === "http://localhost:8080/v1/embeddings", mod.resolveSettings().url);
 check("the settings file was created 0600", (fs.statSync(CONFIG).mode & 0o777) === 0o600);
+fs.rmSync(CONFIG, { force: true });
+
+// The URL row is where an override is authored, and blanking it hands control back to the preset.
+// Start from a store configured for the local endpoint, so the preset under test is distinct.
+fs.writeFileSync(CONFIG, JSON.stringify({ endpoint: "local" }), { mode: 0o600 });
+const urlCtx = (typed) => ({
+	...settingsCtx,
+	ui: {
+		...settingsCtx.ui,
+		select: (() => {
+			let call = 0;
+			return async (_title, options) => {
+				call++;
+				if (call === 1) return options.find((o) => o.startsWith("URL"));
+				return options[options.length - 1];
+			};
+		})(),
+		input: async (_title, placeholder) => typed(placeholder),
+	},
+});
+let urlPrefill = null;
+await captured.commands.get("durable-memory").handler("", urlCtx((prefill) => ((urlPrefill = prefill), "http://127.0.0.1:7777/v1/embeddings")));
+check("the url row is prefilled with the current endpoint's url", urlPrefill === "http://localhost:8080/v1/embeddings", String(urlPrefill));
+check("a typed url becomes the override", mod.resolveSettings().url === "http://127.0.0.1:7777/v1/embeddings" && mod.resolveSettings().urlOverridden === true, mod.resolveSettings().url);
+let overrideRows = [];
+await captured.commands.get("durable-memory").handler("", {
+	...settingsCtx,
+	ui: {
+		...settingsCtx.ui,
+		select: async (_title, options) => ((overrideRows = options), options[options.length - 1]), // "Done"
+	},
+});
+check(
+	"an overridden url is shown with its value and marked",
+	overrideRows.some((o) => o === "URL             http://127.0.0.1:7777/v1/embeddings (overridden)"),
+	JSON.stringify(overrideRows),
+);
+await captured.commands.get("durable-memory").handler("", urlCtx(() => "  "));
+check("a blank entry restores the preset", mod.readSettings().url === undefined && mod.resolveSettings().url === "http://localhost:8080/v1/embeddings", JSON.stringify(mod.readSettings()));
 fs.rmSync(CONFIG, { force: true });
 
 section("[14] refuses a store inside node_modules");
@@ -496,7 +615,239 @@ try {
 	refused = /node_modules/.test(e.message) && /would delete the store/.test(e.message);
 }
 check("a store path under node_modules makes the tool fail loudly", refused);
-process.env.DURABLE_MEMORY_DIR = goodDir;
+// Restoring an unset variable by assignment would set the string "undefined", so delete it.
+if (goodDir === undefined) delete process.env.DURABLE_MEMORY_DIR;
+else process.env.DURABLE_MEMORY_DIR = goodDir;
+
+// ── 15. two stores: local writable, global read-only ─────────────
+section("[15] a global store is merged into surface and never written");
+const GLOBAL_DIR = path.join(SCRATCH, "global-store");
+const GLOBAL_DB = path.join(GLOBAL_DIR, "memory.db");
+const DEPLOY_QUERY = "Deploying from a clean checkout. The surrounding work: the shared deploy script and the forward-only postgres migrations it runs.";
+const globalSnapshot = () => {
+	const handle = new DatabaseSync(GLOBAL_DB, { readOnly: true });
+	try {
+		return JSON.stringify({
+			rows: handle.prepare("SELECT id, body, emb, score, sessions, updated_at FROM memories ORDER BY id").all(),
+			meta: handle.prepare("SELECT k, v FROM meta ORDER BY k").all(),
+		});
+	} finally {
+		handle.close();
+	}
+};
+const globalCount = () => {
+	const handle = new DatabaseSync(GLOBAL_DB, { readOnly: true });
+	try {
+		return Number(handle.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
+	} finally {
+		handle.close();
+	}
+};
+const withGlobalMeta = (fn) => {
+	const handle = new DatabaseSync(GLOBAL_DB);
+	try {
+		return fn(handle);
+	} finally {
+		handle.close();
+	}
+};
+const restoreDir = (value) => {
+	if (value === undefined) delete process.env.DURABLE_MEMORY_DIR;
+	else process.env.DURABLE_MEMORY_DIR = value;
+};
+
+// Seed the shared corpus through the tool itself, with the real embedder, then remove the golden
+// vector: a corpus seeded out of band carries none, and searching one must not add one.
+const localDir = process.env.DURABLE_MEMORY_DIR;
+process.env.DURABLE_MEMORY_DIR = GLOBAL_DIR;
+await fire("session_shutdown");
+const seeded = await call({
+	op: "create",
+	create: ["Deploy scripts must run against a clean checkout.", "Postgres migrations in this project run forward only, never down."],
+});
+check("the shared corpus was seeded", seeded.details.report.created.length === 2);
+withGlobalMeta((handle) => handle.prepare("DELETE FROM meta WHERE k = 'golden'").run());
+const seededSnapshot = globalSnapshot();
+
+restoreDir(localDir);
+process.env.DURABLE_MEMORY_GLOBAL_DIR = GLOBAL_DIR;
+await fire("session_shutdown");
+// A local memory on the same topic, so both stores contribute and the labelling rule is exercised.
+await call({ op: "create", create: ["The deploy script needs a clean checkout, and its migrations only run forward."] });
+const mergedText = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+check("both stores are searched and labelled", /\[global\]/.test(mergedText) && /\[local\]/.test(mergedText), mergedText.slice(0, 400));
+check("the shared corpus is found", /clean checkout/i.test(mergedText), mergedText.slice(0, 400));
+check("searching the global store did not write to it", globalSnapshot() === seededSnapshot, "global rows or meta changed");
+
+await call({ op: "create", create: ["A private memory written while a shared store was mounted."] });
+check("a create went to the local store only", globalCount() === 2, `global rows: ${globalCount()}`);
+check("a read-only store refuses a direct write", (() => {
+	const ro = new MemoryStore(GLOBAL_DIR, { readOnly: true });
+	try {
+		ro.vote([{ id: "aaaa0000", helpful: true }]);
+		return false;
+	} catch (e) {
+		return /read-only store/.test(e.message);
+	} finally {
+		ro.close();
+	}
+})());
+
+// A corpus embedded with a different model cannot be searched, and must not be rewritten to fit.
+withGlobalMeta((handle) => handle.prepare("UPDATE meta SET v = 'some-other-model' WHERE k = 'embedder'").run());
+await fire("session_shutdown");
+const mismatched = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+check("a mismatched corpus is skipped with its reason", /global store was skipped/.test(mismatched) && /not comparable/.test(mismatched), mismatched.slice(0, 300));
+check("the local store still answers", /\[1\] id: [0-9a-f]{8}/.test(mismatched) && !/No store could be searched/.test(mismatched), mismatched.slice(0, 300));
+check("and the mismatched corpus was left alone", withGlobalMeta((handle) => handle.prepare("SELECT k FROM meta WHERE k = 'golden'").get() === undefined));
+
+delete process.env.DURABLE_MEMORY_GLOBAL_DIR;
+await fire("session_shutdown");
+const soloAgain = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+check("with the global store unmounted the labels disappear", !/\[local\]/.test(soloAgain) && !/\[global\]/.test(soloAgain), soloAgain.slice(0, 300));
+
+// ── 16. LEGACY STORE MIGRATION — temporary; cut with its section in ../index.ts ──
+section("[16] stores from every earlier release are migrated on open");
+const KEY_BYTES = crypto.randomBytes(32);
+const sealed = (text) => {
+	const iv = crypto.randomBytes(12);
+	const c = crypto.createCipheriv("aes-256-gcm", KEY_BYTES, iv);
+	const ct = Buffer.concat([c.update(text, "utf8"), c.final()]);
+	return Buffer.concat([iv, c.getAuthTag(), ct]); // iv(12) || tag(16) || ciphertext
+};
+const CURRENT_COLS = ["id", "body", "emb", "score", "sessions", "created_at", "updated_at"];
+
+/**
+ * Builds a store exactly as the named release left it. Three shapes ever shipped:
+ *   0.1.0–0.2.0  dim + surfaces + pointers + meta('embedder')
+ *   0.2.x–0.3.4  pointers + meta('embedder')
+ *   0.3.5        current columns + meta('encrypted')
+ * Every pre-0.3.5 store was encrypted and carried no mode row; the keyfile is the only evidence.
+ */
+function makeLegacyStore(dir, shape, { keyfile = true } = {}) {
+	fs.rmSync(dir, { recursive: true, force: true });
+	fs.mkdirSync(dir, { recursive: true });
+	if (keyfile) fs.writeFileSync(path.join(dir, "memory.key"), KEY_BYTES, { mode: 0o600 });
+	const db = new DatabaseSync(path.join(dir, "memory.db"));
+	try {
+		const deadColumns = shape === "0.1.0" ? "dim INTEGER NOT NULL, surfaces INTEGER NOT NULL DEFAULT 0," : "";
+		db.exec(`
+			CREATE TABLE memories (
+				id TEXT PRIMARY KEY, body BLOB NOT NULL, emb BLOB NOT NULL, ${deadColumns}
+				score REAL NOT NULL DEFAULT 0, sessions TEXT NOT NULL DEFAULT '[]',
+				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			);
+			CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+		`);
+		if (shape !== "0.3.5") {
+			db.exec(`
+				CREATE TABLE pointers (
+					id TEXT PRIMARY KEY, memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+					body BLOB NOT NULL, session_id TEXT NOT NULL, created_at INTEGER NOT NULL
+				);
+				CREATE INDEX pointers_memory ON pointers(memory_id);
+			`);
+			db.prepare("INSERT INTO meta (k, v) VALUES ('embedder', ?)").run("stub-model");
+		} else {
+			db.prepare("INSERT INTO meta (k, v) VALUES ('embedder', ?)").run("stub-model");
+			db.prepare("INSERT INTO meta (k, v) VALUES ('encrypted', ?)").run("false");
+		}
+		const text = `a memory written by ${shape} that must survive the migration`;
+		const vec = new Float32Array(1024).fill(0.01);
+		// 0.3.5 stores can be unencrypted; every earlier shape always was.
+		const body = shape === "0.3.5" ? Buffer.from(text, "utf8") : sealed(text);
+		const sql = shape === "0.1.0"
+			? "INSERT INTO memories (id, body, emb, dim, score, sessions, created_at, updated_at) VALUES (?,?,?,1024,0,'[]',1,1)"
+			: "INSERT INTO memories (id, body, emb, score, sessions, created_at, updated_at) VALUES (?,?,?,0,'[]',1,1)";
+		db.prepare(sql).run("aaaa7777", body, Buffer.from(vec.buffer));
+		if (shape !== "0.3.5") {
+			db.prepare("INSERT INTO pointers (id, memory_id, body, session_id, created_at) VALUES (?,?,?,?,?)")
+				.run("pppp7777", "aaaa7777", sealed("an orphaned note"), "sess-legacy", 1);
+		}
+	} finally {
+		db.close();
+	}
+	return dir;
+}
+
+function inspect(dir) {
+	const db = new DatabaseSync(path.join(dir, "memory.db"), { readOnly: true });
+	try {
+		return {
+			columns: db.prepare("PRAGMA table_info(memories)").all().map((c) => c.name),
+			tables: db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((r) => r.name),
+			mode: db.prepare("SELECT v FROM meta WHERE k = 'encrypted'").get()?.v,
+			rows: Number(db.prepare("SELECT COUNT(*) AS n FROM memories").get().n),
+		};
+	} finally {
+		db.close();
+	}
+}
+
+for (const shape of ["0.1.0", "0.3.0", "0.3.5"]) {
+	const dir = makeLegacyStore(path.join(SCRATCH, `legacy-${shape}`), shape);
+	const before = inspect(dir);
+	const store = new MemoryStore(dir);
+	const after = inspect(dir);
+	const legacy = shape !== "0.3.5";
+
+	check(`[${shape}] columns normalised to the current schema`, JSON.stringify(after.columns) === JSON.stringify(CURRENT_COLS), after.columns.join(","));
+	check(`[${shape}] the dead columns are gone`, !after.columns.includes("dim") && !after.columns.includes("surfaces"), after.columns.join(","));
+	check(`[${shape}] the orphan pointers table is gone`, !after.tables.includes("pointers"), after.tables.join(","));
+	if (legacy) {
+		check(`[${shape}] the mode row is backfilled from the keyfile`, before.mode === undefined && after.mode === "true", `before ${before.mode} after ${after.mode}`);
+		check(`[${shape}] the store reports itself encrypted`, store.encrypted === true);
+	} else {
+		check(`[${shape}] an existing mode row is left alone`, after.mode === "false", String(after.mode));
+	}
+	let found = null;
+	let err = null;
+	try {
+		found = await store.surface("a memory written before the migration that must survive");
+	} catch (e) {
+		err = e.message;
+	}
+	// The rows predate this session, so their vectors are re-embedded and their bodies must decode.
+	check(`[${shape}] a pre-existing row still reads back`, err === null && found?.hits.some((h) => h.id === "aaaa7777"), err ?? JSON.stringify(found?.hits.map((h) => h.id)));
+	let wrote = null;
+	try {
+		wrote = (await store.create([`a memory written after the ${shape} migration`], "sess-now")).length === 1;
+	} catch (e) {
+		wrote = e.message;
+	}
+	check(`[${shape}] the migrated store takes writes`, wrote === true, String(wrote));
+	check(`[${shape}] every row survived`, inspect(dir).rows === before.rows + 1, `${before.rows} -> ${inspect(dir).rows}`);
+	store.close();
+
+	// Opening again must change nothing: the migration is idempotent on an already-current store.
+	const again = new MemoryStore(dir);
+	const twice = inspect(dir);
+	check(`[${shape}] a second open changes no schema`, JSON.stringify(twice.columns) === JSON.stringify(after.columns) && JSON.stringify(twice.tables) === JSON.stringify(after.tables), JSON.stringify(twice));
+	check(`[${shape}] and keeps the mode it recorded`, twice.mode === after.mode, `${after.mode} -> ${twice.mode}`);
+	again.close();
+}
+
+// A pre-0.3.5 store never had a mode row, so a keyfile alone means encrypted — even with no rows,
+// which the old sample-decrypt check could not tell apart from an unencrypted store.
+const EMPTY_LEGACY = makeLegacyStore(path.join(SCRATCH, "legacy-empty"), "0.3.0");
+{
+	const handle = new DatabaseSync(path.join(EMPTY_LEGACY, "memory.db"));
+	try {
+		handle.exec("DELETE FROM memories; DELETE FROM pointers;");
+	} finally {
+		handle.close();
+	}
+}
+check("an empty legacy store with a keyfile is still encrypted", new MemoryStore(EMPTY_LEGACY).encrypted === true);
+
+// A 0.3.5 store switched off keeps its keyfile; the recorded mode wins, so it must stay unencrypted.
+const SWITCHED_OFF = makeLegacyStore(path.join(SCRATCH, "legacy-switched-off"), "0.3.5");
+check("a 0.3.5 store that was switched off stays unencrypted despite its keyfile", new MemoryStore(SWITCHED_OFF).encrypted === false);
+
+// Leave no scratch stores behind on a clean run; keep them on failure so they can be inspected.
+if (failures === 0) {
+	for (const dir of [SCRATCH, SCRATCH3]) fs.rmSync(dir, { recursive: true, force: true });
+}
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s)`);
 process.exit(failures === 0 ? 0 : 1);

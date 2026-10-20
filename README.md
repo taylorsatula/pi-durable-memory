@@ -4,8 +4,8 @@ Long-term memory for [pi](https://github.com/earendil-works/pi-coding-agent), re
 embedding similarity. It stores short notes from past sessions and surfaces the relevant ones
 when you start new work.
 
-Memories are stored unencrypted by default; AES-256-GCM encryption is optional. Embeddings
-are never encrypted, because encrypted content cannot be searched.
+Memories are stored unencrypted by default; AES-256-GCM encryption is one menu choice away.
+Embeddings are never encrypted, because encrypted content cannot be searched.
 
 ## Install
 
@@ -30,8 +30,9 @@ Memories live in `memory.db`, outside the package directory, so they survive `pi
 ## Settings
 
 Run `/durable-memory` with no arguments for an interactive menu. You can configure the
-embedding endpoint, model, auth key, and database location. Settings are saved to
-`~/.pi/agent/durable-memory/config.json`.
+embedding endpoint, model, auth key, database location, and whether the local store is
+encrypted. Settings are saved to `~/.pi/agent/durable-memory/config.json`. `/durable-memory
+status` prints the same information without a menu.
 
 Environment variables override settings when present:
 
@@ -41,13 +42,29 @@ Environment variables override settings when present:
 | `DURABLE_MEMORY_EMBED_MODEL` | Embedding model name |
 | `DURABLE_MEMORY_EMBED_KEY` | Auth key |
 | `DURABLE_MEMORY_DIR` | Database directory |
+| `DURABLE_MEMORY_GLOBAL_DIR` | Read-only shared store, merged into `surface` |
+
+## Shared stores
+
+A second, read-only store can be mounted next to your own — a team corpus everyone searches
+while each person still writes privately to their local store. Mounting one, seeding it, and
+what happens when its vectors were built with a different embedding model are covered in
+[docs/global-store.md](docs/global-store.md).
 
 ## Verification
 
+The probe and the retrieval benchmark live in the repository, not in the published package:
+
 ```bash
-node bench/probe.mjs   # functional check
-node bench/run.mjs     # retrieval benchmark
+git clone https://github.com/taylorsatula/pi-durable-memory
+cd pi-durable-memory
+node bench/probe.mjs   # functional witness: every code path, end to end
+node bench/run.mjs     # retrieval benchmark behind the cosine floor and K
 ```
+
+Both need an embedding credential (`DURABLE_MEMORY_EMBED_KEY`, the `apiKey` in
+`~/.pi/agent/durable-memory/config.json`, or a `lunaroute` entry in `~/.pi/agent/auth.json`)
+and run against a scratch store, never your own. `npm publish` runs the probe first.
 
 ## Known limits
 
@@ -55,3 +72,4 @@ node bench/run.mjs     # retrieval benchmark
 - Embeddings are stored in cleartext.
 - Search scans all memories in memory; fine up to a few thousand.
 - Memories are global, not scoped per project.
+- A shared store is read-only: it can be searched, never written or re-embedded from here.

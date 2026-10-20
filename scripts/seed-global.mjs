@@ -29,8 +29,8 @@ const db = new DatabaseSync(path.join(dir, "memory.db"));
 db.exec(`
   PRAGMA journal_mode = WAL;
   CREATE TABLE IF NOT EXISTS memories (
-    id TEXT PRIMARY KEY, body BLOB NOT NULL, emb BLOB NOT NULL, dim INTEGER NOT NULL,
-    score REAL NOT NULL DEFAULT 0, surfaces INTEGER NOT NULL DEFAULT 0,
+    id TEXT PRIMARY KEY, body BLOB NOT NULL, emb BLOB NOT NULL,
+    score REAL NOT NULL DEFAULT 0,
     sessions TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -50,13 +50,13 @@ async function embed(texts) {
 const vectors = await embed(lines);
 const now = Date.now();
 const insert = db.prepare(
-  "INSERT INTO memories (id, body, emb, dim, score, surfaces, sessions, created_at, updated_at) VALUES (?, ?, ?, ?, 0, 0, '[]', ?, ?)",
+  "INSERT INTO memories (id, body, emb, score, sessions, created_at, updated_at) VALUES (?, ?, ?, 0, '[]', ?, ?)",
 );
 db.exec("BEGIN");
 let n = 0;
 for (let i = 0; i < lines.length; i++) {
   const id = (Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2)).slice(0, 8);
-  insert.run(id, Buffer.from(lines[i], "utf8"), Buffer.from(new Float32Array(vectors[i]).buffer), vectors[i].length, now, now);
+  insert.run(id, Buffer.from(lines[i], "utf8"), Buffer.from(new Float32Array(vectors[i]).buffer), now, now);
   n++;
 }
 db.prepare("INSERT INTO meta (k, v) VALUES ('embedder', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(model);

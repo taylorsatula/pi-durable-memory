@@ -4,9 +4,10 @@ memory.db-wal
 memory.db-shm
 memory.key
 
-# Benchmark inputs derived from the operator's own session history.
-bench/corpus.json
-bench/embcache.json
+# Development-only: the probe drives this checkout through pi's own jiti and needs a corpus built
+# from the operator's session history, so none of it is useful to someone who installed the package.
+# `npm publish` still runs bench/probe.mjs locally as its prepublishOnly gate.
+bench/
 
 # Pack artifacts
 *.tgz
