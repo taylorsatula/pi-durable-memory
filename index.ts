@@ -231,7 +231,7 @@ function rule(width = 5): string {
  * install, then never again for that version.
  */
 const RELEASE_NOTES: Record<string, string> = {
-	"0.4.0": [
+	"0.4.1": [
 		"The memory prompt has been significantly improved — and it will be iteratively improved more over time.",
 		"",
 		"This release rewrites the instructions that guide what the agent saves to memory — the memory",
