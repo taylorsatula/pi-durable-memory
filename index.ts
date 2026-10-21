@@ -170,6 +170,9 @@ type Op = (typeof OPS)[number];
 /**
  * Returned verbatim on every `checkpoint` call. Task-scoped, not session-scoped: a model cannot
  * observe "the session is ending", but it can observe "the task is done".
+ *
+ * Directive v2 (shipped 0.4.0), rewritten against the first real corpus — the commit that touched
+ * this line carries the full evolution record and the protocol for the next prompt revision.
  */
 const CHECKPOINT_MESSAGE = [
 	`${rule()} CHECKPOINT — RECORD WHAT YOU LEARNED ${rule()}`,
