@@ -136,7 +136,7 @@ check("schema exposes all six ops", ["surface", "checkpoint", "create", "edit", 
 check("the query parameter asks for the surrounding-work second part", /The surrounding work:/i.test(JSON.stringify(tool.parameters)));
 check("the description says encryption is optional, not assumed", /optionally encrypted/i.test(tool.description), tool.description.slice(0, 140));
 const schema = JSON.stringify(tool.parameters);
-const BAR = "could not re-derive from the tree";
+const BAR = "no readable text supplies";
 check("the create parameter carries the storeability bar", schema.includes(BAR));
 check("the edit parameter names itself the merge path for a duplicate", /rather than `create` a variant/i.test(schema));
 check("names the delete-before-edit trap where it states the order", /delete first, so never delete and edit the same id/i.test(schema));

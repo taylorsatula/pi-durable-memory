@@ -176,9 +176,26 @@ const CHECKPOINT_MESSAGE = [
 	"",
 	"You just completed a unit of work. Batch the following into ONE call:",
 	"",
-	"1. `create` — what a later session could not re-derive from the tree. One self-contained sentence.",
-	"   Tag every measurement with its witness. Where a surfaced id already carries the fact, `edit` it",
-	"   rather than `create` a second one.",
+	"1. `create` — facts no readable text supplies. One self-contained sentence per fact: a",
+	"   gnomic-present stative proposition — what IS, never what happened; events culminate and rot,",
+	"   states hold until refuted, and the aspect is the shelf life.",
+	"",
+	"   Endophorically complete: no deixis, no exophora — the session that wrote it no longer exists",
+	"   at retrieval time. Rigidly designated: paths, error strings, proper nouns, numerals — never",
+	"   hypernyms or quantified generics. Paratactically extended, not subordinated: fact and context",
+	"   as one embedding unit with two retrieval surfaces. The theme names where it fires — the file,",
+	"   command, or decision moment that will need this memory.",
+	"",
+	"   Not entailed by any accessible text: what the repo, docstrings, or this tool's instructions",
+	"   say, they say better, and a second copy diverges. Carry the verification condition — the",
+	"   checkable path, string, or command whose change proves the row stale; an unfalsifiable row",
+	"   is a belief.",
+	"",
+	"   The negative, never: a perfective event report — exophoric, deictic, hedged, autological,",
+	"   duplicated, or entailed — culminated work with no next time and no killer. Two tests before",
+	"   recording: WHEN does this next fire, WHAT kills it? Either unanswered — no call. Where a",
+	"   surfaced id already carries the fact, `edit` it rather than `create` a second one; a ruling",
+	"   that contradicts an existing row edits that row; never append a duplicate beside it.",
 	"",
 	"2. `helpful` — rate every id `surface` showed you and you have not rated: `true` if it changed what",
 	"   you did, `false` if it did not. Ratings decide what surfaces next; guess rather than skip.",
@@ -871,9 +888,14 @@ const PARAMS = Type.Object({
 	create: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Memory texts to store: what a later session could not re-derive from the tree, one self-contained " +
-				'sentence each. Example: ["The mira repo forbids mock objects in tests; verification runs live ' +
-				'probes against real infrastructure."]',
+				"Memory texts to store: one gnomic-present stative proposition per fact of what no readable " +
+				"text supplies — endophorically complete (no deixis or exophora; the writing session is gone " +
+				"at retrieval time), rigidly designated (paths, error strings, proper nouns, numerals — never " +
+				"hypernyms), paratactically extended rather than subordinated, opening on the file, command, " +
+				"or decision moment where it fires, and carrying its verification condition — the checkable " +
+				"path, string, or command whose change proves the row stale. " +
+				'Example: ["npm publish fails with 401/ENEEDAUTH — the ~/.npmrc token returns 401 on publish; ' +
+				'the working credential is a bypass token only the user supplies on request."]',
 		}),
 	),
 	edit: Type.Optional(
@@ -897,7 +919,7 @@ const DESCRIPTION = [
 	"Long-term memory that persists across sessions, searched by embedding similarity and optionally encrypted at rest.",
 	"",
 	'op "surface" takes `query` — a distill of the work, shaped as the parameter description specifies — and returns what',
-	"earlier sessions could not re-derive from the tree.",
+	"no readable text supplies.",
 	"",
 	'op "checkpoint" takes nothing and returns the recording instructions for one completed task — not for the session.',
 	"The other four store, correct, remove, and rate.",
