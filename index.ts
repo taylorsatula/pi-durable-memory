@@ -219,6 +219,72 @@ function rule(width = 5): string {
 	return MARK.repeat(width);
 }
 
+// ── Release notes ───────────────────────────────────────────────
+
+/**
+ * Per-version notes pushed to the user on the session starts after an update. Keyed by the
+ * package version — `announced.txt` in the store directory records the version and how many
+ * times its note has been shown, so each note fires on the first two interactive loads of an
+ * install, then never again for that version.
+ */
+const RELEASE_NOTES: Record<string, string> = {
+	"0.4.0": [
+		"The memory prompt has been significantly improved — and it will be iteratively improved more over time.",
+		"",
+		"This release rewrites the instructions that guide what the agent saves to memory — the memory",
+		"prompt — from scratch. We analyzed a real corpus of 139 memories written under the old",
+		"instructions and found recurring problems: session reports ('we rewrote X today') instead of",
+		"durable facts; raw numbers from one-off passes; literal duplicates; stale entries contradicted",
+		"by newer ones that were never removed; and many facts already written in project files, docs,",
+		"or the tool's own built-in instructions — material the agent re-reads every session anyway.",
+		"None of these help a future session, and every memory search had to fight through them.",
+		"",
+		"The new instructions are simple and strict: save only what a future session could not get from",
+		"any file, doc, or built-in instruction; write each memory as a single self-contained sentence",
+		"stating something that IS true, not a report of what happened once; open with where it matters",
+		"(the file, command, or decision it concerns); use exact names, paths, and error text rather than",
+		"vague categories; never save a second copy of something already stored; and state the concrete",
+		"check that would reveal when the memory has gone stale. The result: future memory searches",
+		"return fewer, better entries.",
+		"",
+		"Entries written under the old instructions mix into every search result. Due to this jump, if",
+		"possible, delete your existing memory SQLite store and let the memories regenerate:",
+		"",
+		"    rm ~/.pi/agent/durable-memory/memory.db*",
+		"",
+		"Your config.json is untouched, and the store recreates itself on the next start — fresh",
+		"memories will accumulate naturally over future sessions.",
+		"",
+		"Alternatively, rather than deleting, a coding agent can temporarily rename the old memory db,",
+		"read the new directive, then load the old SQLite and cherry-pick out the best memories to reword",
+		"and carry forward into the fresh store.",
+		"",
+		"This will not likely be the case on each release — but during these early releases there are drastic",
+		"improvements in memory quality.",
+	].join("\n"),
+};
+
+/**
+ * package.json sits beside index.ts in both the dev repo and the installed package. A load with no
+ * manifest beside it (a vendored copy of the file) announces nothing — "unknown" matches no entry.
+ */
+function packageVersion(): string {
+	try {
+		const manifest = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8")) as {
+			version?: string;
+		};
+		return manifest.version ?? "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+/** The last version whose notes were shown and how many times ("0.4.0 2"), beside config.json. */
+const ANNOUNCED_PATH = path.join(DEFAULT_STORE_DIR, "announced.txt");
+
+/** A session-start toast is easy to miss once, so a version's note shows on the first two interactive loads. */
+const ANNOUNCES_PER_VERSION = 2;
+
 // ── Encryption ───────────────────────────────────────────────────────
 
 /** AES-256-GCM. Layout: iv(12) || tag(16) || ciphertext. */
@@ -1160,7 +1226,26 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		store = undefined;
 	};
 
-	pi.on("session_start", () => {
+	/**
+	 * Announces this version's release notes on the first two interactive session starts after an
+	 * update, then never again for that version. The marker file holds "version shown-count" and
+	 * advances only when the note was actually shown — headless runs (notify is a no-op there)
+	 * leave it unwritten, and the next interactive session still sees the note.
+	 */
+	const announceReleaseNotes = (ctx: ExtensionContext): void => {
+		const version = packageVersion();
+		const notes = RELEASE_NOTES[version];
+		if (!notes || !ctx.hasUI) return;
+		const marker = fs.existsSync(ANNOUNCED_PATH) ? fs.readFileSync(ANNOUNCED_PATH, "utf8") : "";
+		const shown = marker.startsWith(`${version} `) ? Number(marker.split(" ")[1]) : 0;
+		if (shown >= ANNOUNCES_PER_VERSION) return;
+		fs.mkdirSync(DEFAULT_STORE_DIR, { recursive: true, mode: 0o700 });
+		fs.writeFileSync(ANNOUNCED_PATH, `${version} ${Number.isFinite(shown) ? shown + 1 : 1}`, { mode: 0o600 });
+		ctx.ui.notify(`pi-durable-memory ${version}\n${notes}`, "info");
+	};
+
+	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+		announceReleaseNotes(ctx);
 		surfaceCalls = 0;
 		closeStores();
 	});

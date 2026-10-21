@@ -81,6 +81,9 @@ if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
 if (!process.env.DURABLE_MEMORY_EMBED_KEY) throw new Error("no embedding credential found; set DURABLE_MEMORY_EMBED_KEY");
 const SRC = path.join(SCRATCH, "index.ts");
 fs.copyFileSync(path.join(PKG, "index.ts"), SRC);
+// package.json rides along: the release-notes announcement reads its version from beside the module,
+// exactly as a real install lays the files out.
+fs.copyFileSync(path.join(PKG, "package.json"), path.join(SCRATCH, "package.json"));
 const PROBE_STORE = path.join(AGENT, "durable-memory");
 
 const jiti = createJiti(import.meta.url, {
@@ -148,6 +151,41 @@ check("the description owns the api and leaves the trigger alone", !/before your
 check("the description names all six ops", ["surface", "checkpoint"].every((o) => tool.description.includes(o)) && /The other four store, correct, remove, and rate/.test(tool.description), tool.description);
 
 await fire("session_start");
+
+// ── 1b. release notes: the first two interactive loads per installed version ─────
+section("[1b] release notes announce on the first two loads per version");
+const VERSION = JSON.parse(fs.readFileSync(path.join(SCRATCH, "package.json"), "utf8")).version;
+const noteNotices = () => notices.filter((n) => n.text.startsWith(`pi-durable-memory ${VERSION}`));
+const announcedState = () => fs.readFileSync(path.join(PROBE_STORE, "announced.txt"), "utf8");
+check(
+	"announces the installed version's notes on the first session start",
+	noteNotices().length === 1 && /significantly improved/.test(noteNotices()[0].text) && /delete your existing memory SQLite store/.test(noteNotices()[0].text),
+	String(noteNotices().length),
+);
+check(
+	"the note carries the regeneration command and the settings reassurance",
+	/rm ~\/\.pi\/agent\/durable-memory\/memory\.db\*/.test(noteNotices()[0].text) && /config\.json is untouched/i.test(noteNotices()[0].text),
+);
+check(
+	"the note offers the rename-and-carry-forward alternative to deletion",
+	/temporarily rename the old memory db/.test(noteNotices()[0].text) && /cherry-pick out the best memories/.test(noteNotices()[0].text),
+);
+check("records the version and show count in the store directory", announcedState() === `${VERSION} 1`);
+await fire("session_start");
+check("a second session start announces the note once more", noteNotices().length === 2 && announcedState() === `${VERSION} 2`);
+await fire("session_start");
+check("a third session start does not announce again", noteNotices().length === 2);
+fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.0.0 2");
+await (captured.handlers.get("session_start") ?? [])[0]?.({ type: "session_start" }, { ...ctx, hasUI: false });
+check(
+	"a headless run announces nothing and leaves the marker untouched",
+	announcedState() === "0.0.0 2" && noteNotices().length === 2,
+);
+await fire("session_start");
+check(
+	"the next interactive session start announces a pending version from its first show",
+	noteNotices().length === 3 && announcedState() === `${VERSION} 1`,
+);
 
 // ── 2. checkpoint is a static push alert ─────────────────────────────────
 section("[2] checkpoint is static and needs no I/O");
