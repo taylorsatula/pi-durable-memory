@@ -1,7 +1,7 @@
 {
   "name": "@taylorsatula/pi-durable-memory",
-  "version": "0.4.0",
-  "description": "Embedding-searched long-term memory for pi, with a surface/checkpoint attention-sink loop",
+  "version": "0.4.1",
+  "description": "Persistent long-term memory for pi: remembers what your agent learned across sessions, recalls the right facts automatically at the start of each task, and stores them locally in SQLite (searched by meaning, not keywords, with optional encryption).",
   "keywords": [
     "pi-package",
     "pi-extension",
