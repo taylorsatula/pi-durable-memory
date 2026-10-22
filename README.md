@@ -30,8 +30,9 @@ Memories live in `memory.db`, outside the package directory, so they survive `pi
 ## Settings
 
 Run `/durable-memory` with no arguments for an interactive menu. You can configure the
-embedding endpoint, model, auth key, database location, and whether the local store is
-encrypted. Settings are saved to `~/.pi/agent/durable-memory/config.json`. `/durable-memory
+embedding endpoint, model, auth key, database location, whether the local store is
+encrypted, and a debug toggle. Settings are saved to
+`~/.pi/agent/durable-memory/config.json`. `/durable-memory
 status` prints the same information without a menu.
 
 Environment variables override settings when present:
@@ -43,6 +44,22 @@ Environment variables override settings when present:
 | `DURABLE_MEMORY_EMBED_KEY` | Auth key |
 | `DURABLE_MEMORY_DIR` | Database directory |
 | `DURABLE_MEMORY_GLOBAL_DIR` | Read-only shared store, merged into `surface` |
+| `DURABLE_MEMORY_DEBUG` | Set to `1` to enable the debug surface log |
+
+### Debug surface log
+
+A `debug` toggle (off by default) records, in a separate sqlite database at
+`~/.pi/agent/durable-memory/surface-log.db`, every `surface` query the agent writes, the hits
+it returned in ranked order, and every `helpful` rating against a surfaced id. It is for
+studying whether the agent is writing good surface distills — turn it on, work normally, then
+read the log:
+
+```
+sqlite3 ~/.pi/agent/durable-memory/surface-log.db
+```
+
+The log is always plaintext and lives outside the memory store: it is a debug artifact, not
+data — delete it whenever the study is done.
 
 ## Shared stores
 
