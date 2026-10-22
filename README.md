@@ -19,11 +19,13 @@ follows `PI_CODING_AGENT_DIR` if you have set it.
 ## How it works
 
 The extension adds one tool, `durable_memory`, and one command, `/durable-memory`.
+Every call carries an `action` that selects what it does — arguments that do not belong to the
+named action are rejected, never silently ignored or applied:
 
 - `surface` looks up memories related to a query and returns the best matches.
 - `checkpoint` returns a reminder to store what you learned and rate what you saw.
-- `create`, `edit`, `delete` manage memories.
-- `helpful` rates memories so more useful ones rank higher.
+- `mutate` applies the mutation arrays — `create`, `edit`, `delete` manage memories, `helpful`
+  rates them so more useful ones rank higher — all in one call, in a fixed order.
 
 Memories live in `memory.db`, outside the package directory, so they survive `pi update`.
 

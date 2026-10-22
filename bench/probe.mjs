@@ -126,6 +126,7 @@ const fire = async (event) => {
 mod.default(pi);
 const tool = captured.tools.get("durable_memory");
 const call = (params) => tool.execute("call-1", params, undefined, undefined, ctx);
+const mutate = (params) => call({ action: "mutate", ...params });
 const textOf = (r) => r.content.map((c) => c.text).join("\n");
 
 // ── 1. registration and the system-prompt injection ──────────────────
@@ -135,9 +136,15 @@ check("registers /durable-memory", captured.commands.has("durable-memory"));
 check("hooks session_start and session_shutdown", (captured.handlers.get("session_start") ?? []).length === 1 && (captured.handlers.get("session_shutdown") ?? []).length === 1);
 check("contributes a promptSnippet for the tool list", typeof tool.promptSnippet === "string" && tool.promptSnippet.length > 0);
 const guides = (tool.promptGuidelines ?? []).join("\n");
-check("guideline makes the surface trigger transcript-checkable", /have not yet called/i.test(guides) && /Check your own transcript/i.test(guides) && /op: "surface"/.test(guides), guides);
+check("guideline makes the surface trigger transcript-checkable", /have not yet called/i.test(guides) && /Check your own transcript/i.test(guides) && /action: "surface"/.test(guides), guides);
 check("guideline makes the checkpoint trigger transcript-checkable", /Check your transcript for a `checkpoint` call after that task or commit/i.test(guides), guides);
-check("schema exposes all six ops", ["surface", "checkpoint", "create", "edit", "delete", "helpful"].every((o) => JSON.stringify(tool.parameters).includes(o)));
+const actionEnum = tool.parameters.properties.action.enum;
+check("the action enum is exactly surface, checkpoint, mutate",
+	JSON.stringify(actionEnum) === JSON.stringify(["surface", "checkpoint", "mutate"]),
+	JSON.stringify(actionEnum));
+check("the dispatch parameter is named action, not op", tool.parameters.properties.action !== undefined && tool.parameters.properties.op === undefined, JSON.stringify(Object.keys(tool.parameters.properties)));
+check("the schema marks action required", (tool.parameters.required ?? []).includes("action"), JSON.stringify(tool.parameters.required));
+check("the description says arguments outside the named action are rejected", /does not belong to the named action is rejected/.test(tool.description) || /named action is rejected/.test(JSON.stringify(tool.parameters)), tool.description);
 check("the query parameter asks for the surrounding-work second part", /The surrounding work:/i.test(JSON.stringify(tool.parameters)));
 check("the description says encryption is optional, not assumed", /optionally encrypted/i.test(tool.description), tool.description.slice(0, 140));
 const schema = JSON.stringify(tool.parameters);
@@ -149,8 +156,8 @@ check("names the delete-before-edit trap where it states the order", /delete fir
 // guidelines and the description describes the API. Across the permanent/transient boundary the
 // repetition is load-bearing; inside the permanent layer it is waste.
 check("the guidelines own the surface trigger", /call it before your first edit/i.test(guides), guides);
-check("the description owns the api and leaves the trigger alone", !/before your first edit/i.test(tool.description) && /op "surface" takes/i.test(tool.description), tool.description);
-check("the description names all six ops", ["surface", "checkpoint"].every((o) => tool.description.includes(o)) && /The other four store, correct, remove, and rate/.test(tool.description), tool.description);
+check("the description owns the api and leaves the trigger alone", !/before your first edit/i.test(tool.description) && /`action` selects what a call does/.test(tool.description), tool.description);
+check("the description names all three actions and none of the dead op names", ["surface", "checkpoint", "mutate"].every((o) => tool.description.includes(o)) && !/create, edit, delete, helpful/.test(tool.description.replace(/delete, edit, create, helpful/, "")), tool.description);
 
 await fire("session_start");
 
@@ -161,7 +168,7 @@ const noteNotices = (v) => notices.filter((n) => n.text.startsWith(`pi-durable-m
 const announcedState = () => fs.readFileSync(path.join(PROBE_STORE, "announced.txt"), "utf8");
 check(
 	"the first session start announces the current version's short note",
-	noteNotices().length === 1 && /changelog: added an optional debug toggle/.test(noteNotices()[0].text),
+	noteNotices().length === 1 && /dispatch parameter is now `action`/.test(noteNotices()[0].text),
 	noteNotices().map((n) => n.text.slice(0, 80)).join(" | "),
 );
 check(
@@ -173,10 +180,10 @@ check(
 	"the flush note carries the regeneration command and the settings reassurance",
 	/rm ~\/\.pi\/agent\/durable-memory\/memory\.db\*/.test(noteNotices("0.4.1")[0].text) && /config\.json is untouched/i.test(noteNotices("0.4.1")[0].text),
 );
-check("each version carries its own show count", announcedState() === `0.4.1 1\n0.4.2 1\n`, JSON.stringify(announcedState()));
+check("each version carries its own show count", announcedState() === `0.4.1 1\n0.4.2 1\n0.4.3 1\n`, JSON.stringify(announcedState()));
 await fire("session_start");
 check("a second session start announces each note once more", noteNotices().length === 2 && noteNotices("0.4.1").length === 2);
-check("the per-version counts advance to two", announcedState() === `0.4.1 2\n0.4.2 2\n`, JSON.stringify(announcedState()));
+check("the per-version counts advance to two", announcedState() === `0.4.1 2\n0.4.2 2\n0.4.3 2\n`, JSON.stringify(announcedState()));
 await fire("session_start");
 check("a third session start announces nothing", noteNotices().length === 2 && noteNotices("0.4.1").length === 2);
 fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.0.0 2");
@@ -189,8 +196,8 @@ check(
 fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.4.1 2");
 await fire("session_start");
 check(
-	"a user current through 0.4.1 sees only the new note",
-	noteNotices().length === 3 && noteNotices("0.4.1").length === 2 && announcedState() === `0.4.1 2\n0.4.2 1\n`,
+	"a user current through 0.4.1 sees only the newer notes",
+	noteNotices().length === 3 && noteNotices("0.4.1").length === 2 && announcedState() === `0.4.1 2\n0.4.2 1\n0.4.3 1\n`,
 	JSON.stringify(announcedState()),
 );
 // The skipped-release case: a user on 0.4.0 still gets the flush note when they install 0.4.2.
@@ -204,13 +211,13 @@ check(
 
 // ── 2. checkpoint is a static push alert ─────────────────────────────────
 section("[2] checkpoint is static and needs no I/O");
-const f1 = await call({ op: "checkpoint" });
+const f1 = await call({ action: "checkpoint" });
 // Line wrapping is formatting, not wording: phrase checks run on the flattened text so a re-wrap
 // cannot fail a check that is about what the message says.
 const flat = textOf(f1).replace(/\s+/g, " ");
 const SESSION_BEFORE = SESSION;
 SESSION = "01a00000-0000-4000-8000-ffffffffffff";
-const f2 = await call({ op: "checkpoint" });
+const f2 = await call({ action: "checkpoint" });
 SESSION = SESSION_BEFORE;
 check("returns substantive instructions", textOf(f1).length > 400);
 check("byte-identical across calls and sessions", textOf(f1) === textOf(f2));
@@ -218,22 +225,24 @@ check("carries the attention marker", textOf(f1).includes("⟁"));
 check("instructs create", /`create`/.test(textOf(f1)));
 check("instructs rating every surfaced id", /rate every id `surface` showed you/i.test(textOf(f1)), textOf(f1).slice(0, 300));
 check("scopes the closeout to a completed task, not the session", /You just completed a unit of work/i.test(textOf(f1)));
-check("says it is repeatable within a session", /call `checkpoint` again/i.test(textOf(f1)));
+check("says it is repeatable within a session", /call `action: "checkpoint"` again/i.test(textOf(f1)));
 check("does not presuppose the session is ending", !/drawing to a close/i.test(textOf(f1)));
-check("instructs one batched call", /ONE call/i.test(textOf(f1)));
-check("says op labels the call rather than selecting what is applied", /labels the call and selects nothing/i.test(flat) && /every array in it applies/i.test(flat), flat);
+check("instructs one batched mutate call", /ONE `durable_memory` call/i.test(textOf(f1)) && /`action: "mutate"`/.test(textOf(f1)));
+check("says action selects what a call does and rejects strays", /`action` selects what a call does/.test(flat) && /rejected/.test(flat), flat);
 check("gives a routine task a sendable answer: silence, not an empty call", /send nothing/i.test(flat) && !/empty checkpoint call/i.test(flat));
+check("resends stray mutations as mutate rather than dropping them", /resend them as `action: "mutate"`/i.test(flat), flat);
 check("forbids answering the prompt with another checkpoint", /never another `checkpoint`/i.test(flat));
+check("forbids an empty mutate call", /never an empty `mutate`/i.test(flat), flat);
 check("carries an applicable storeability bar, not just a prohibition", flat.includes(BAR));
 check("one wording of the bar carries all three permanent homes and the message", [schema, tool.description, flat].every((t) => t.includes(BAR)), `${schema.includes(BAR)} ${tool.description.includes(BAR)} ${flat.includes(BAR)}`);
 check("routes a near-duplicate to edit instead of a second create", /already carries the fact, `edit` it rather than `create` a second one/i.test(flat), flat);
-check("closes the loop back to surface for the next task", /next task begins with `surface`/i.test(flat));
+check("closes the loop back to surface for the next task", /next task begins with `action: "surface"`/i.test(flat));
 check("no interpolation survives unfilled into the message", !/\$\{/.test(flat), flat);
 check("takes no input and touches no storage", !fs.existsSync(DB));
 
 // ── 3. empty store ───────────────────────────────────────────────────
 section("[3] surface on an empty store");
-const empty = await call({ op: "surface", query: "Building a pi extension that stores encrypted memories in sqlite. The surrounding work is a single TypeScript file registering a tool." });
+const empty = await call({ action: "surface", query: "Building a pi extension that stores encrypted memories in sqlite. The surrounding work is a single TypeScript file registering a tool." });
 check("reports the store is empty", /empty/i.test(textOf(empty)), textOf(empty).slice(0, 120));
 check("still carries the closeout reminder", textOf(empty).includes("⟁"));
 
@@ -246,7 +255,7 @@ if (!corpus) {
 	const negatives = JSON.parse(fs.readFileSync(NEG_PATH, "utf8"));
 	const created = [];
 	for (const m of corpus) {
-		const r = await call({ op: "create", create: [m.memory] });
+		const r = await mutate({ create: [m.memory] });
 		created.push({ qid: m.id, storeId: r.details.report.created[0].id });
 	}
 	check(`stored all ${corpus.length} memories`, created.every((c) => c.storeId));
@@ -256,7 +265,7 @@ if (!corpus) {
 	let empties = 0;
 	for (const m of corpus) {
 		const rich = `${m.query}\n\nThe surrounding work: ${m.synopsis}`;
-		const r = await call({ op: "surface", query: rich });
+		const r = await call({ action: "surface", query: rich });
 		const hits = r.details.hits ?? [];
 		if (hits.length === 0) empties++;
 		const rank = hits.findIndex((h) => h.id === idOf.get(m.id)) + 1;
@@ -272,18 +281,18 @@ if (!corpus) {
 
 	let leaked = 0;
 	for (const q of negatives) {
-		const r = await call({ op: "surface", query: q });
+		const r = await call({ action: "surface", query: q });
 		if ((r.details.hits ?? []).length > 0) leaked++;
 	}
 	console.log(`       off-topic controls returning results: ${leaked}/${negatives.length}`);
 	check("no off-topic control query returned a memory", leaked === 0, `${leaked} leaked`);
 
-	const offTopic = await call({ op: "surface", query: negatives[0] });
+	const offTopic = await call({ action: "surface", query: negatives[0] });
 	check("empty result reports the floor and the closest score", /cosine floor/.test(textOf(offTopic)) && /closest scored/.test(textOf(offTopic)), textOf(offTopic).slice(0, 200));
 	check("empty result tells the model what to add", /The surrounding work:/.test(textOf(offTopic)));
 	check("empty result still carries the closeout reminder", textOf(offTopic).includes("⟁"));
 
-	const sample = await call({ op: "surface", query: `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}` });
+	const sample = await call({ action: "surface", query: `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}` });
 	const t = textOf(sample);
 	check("results render numbered with id, similarity, helpfulness", /\[1\] id: [0-9a-f]{8}\s+similarity: [\d.]+\s+helpfulness: [-\d.]+/.test(t), t.slice(0, 200));
 	check("results are capped at 8", (sample.details.hits ?? []).length <= 8);
@@ -309,17 +318,17 @@ check("keeps the re-surface trigger for a result that already matched", /even if
 	check("create stamped the creating session", stampsOf(stampTarget).length === 1 && stampsOf(stampTarget)[0] === SESSION, JSON.stringify(stampsOf(stampTarget)));
 
 	SESSION = "01a00000-0000-4000-8000-000000000002";
-	await call({ op: "edit", edit: [{ id: stampTarget, text: `${corpus[0].memory} (revised in a later session.)` }] });
+	await mutate({ edit: [{ id: stampTarget, text: `${corpus[0].memory} (revised in a later session.)` }] });
 	check("edit appended the editing session", stampsOf(stampTarget).length === 2 && stampsOf(stampTarget)[1] === SESSION, JSON.stringify(stampsOf(stampTarget)));
 
-	await call({ op: "edit", edit: [{ id: stampTarget, text: `${corpus[0].memory} (revised twice in the same session.)` }] });
+	await mutate({ edit: [{ id: stampTarget, text: `${corpus[0].memory} (revised twice in the same session.)` }] });
 	check("a second edit in the same session does not duplicate the stamp", stampsOf(stampTarget).length === 2, JSON.stringify(stampsOf(stampTarget)));
 
 	SESSION = "01a00000-0000-4000-8000-000000000003";
-	await call({ op: "create", create: ["A memory created in a third session for the stamp test."], helpful: [{ id: stampTarget, helpful: true }] });
+	await mutate({ create: ["A memory created in a third session for the stamp test."], helpful: [{ id: stampTarget, helpful: true }] });
 	check("a helpful vote does not add a stamp", stampsOf(stampTarget).length === 2, JSON.stringify(stampsOf(stampTarget)));
 
-	const found = await call({ op: "surface", query: `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}` });
+	const found = await call({ action: "surface", query: `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}` });
 	const hit = (found.details.hits ?? []).find((h) => h.id === stampTarget);
 	const stamps = stampsOf(stampTarget);
 	const newest = stamps[stamps.length - 1];
@@ -347,10 +356,10 @@ check("surface calls while off wrote no debug log", !fs.existsSync(DEBUG_DB));
 process.env.DURABLE_MEMORY_DEBUG = "1";
 check("DURABLE_MEMORY_DEBUG=1 turns debug on", mod.resolveSettings().debug === true);
 const dbgQuery = `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}`;
-const dbgResult = await call({ op: "surface", query: dbgQuery });
+const dbgResult = await call({ action: "surface", query: dbgQuery });
 const dbgHits = dbgResult.details.hits ?? [];
 const dbgHitId = dbgHits[0]?.id;
-await call({ op: "helpful", helpful: [{ id: dbgHitId, helpful: true }] });
+await mutate({ helpful: [{ id: dbgHitId, helpful: true }] });
 check("the debug log exists once debug is on", fs.existsSync(DEBUG_DB), DEBUG_DB);
 const dbg = new DatabaseSync(DEBUG_DB, { readOnly: true });
 try {
@@ -365,7 +374,7 @@ try {
 	dbg.close();
 }
 delete process.env.DURABLE_MEMORY_DEBUG;
-const dbgAfter = await call({ op: "surface", query: corpus[1].query });
+const dbgAfter = await call({ action: "surface", query: corpus[1].query });
 const dbgCount = () => {
 	const h = new DatabaseSync(DEBUG_DB, { readOnly: true });
 	try {
@@ -398,7 +407,7 @@ const readMeta = (k) => {
 const needle = /mira|Taylor|banana|sqlite|embedding|memory|encrypted|pi extension|vault combination/i;
 const readable = (rs) => rs.filter((r) => needle.test(Buffer.from(r.body).toString("latin1")));
 
-await call({ op: "create", create: ["The vault combination lives only in the operator's head."] });
+await mutate({ create: ["The vault combination lives only in the operator's head."] });
 let rows = readRows();
 check("rows exist", rows.length > 0, String(rows.length));
 check("all vectors are 1024-dim emb-qwen3", rows.every((r) => Buffer.from(r.emb).length === 4096), String(rows[0] && Buffer.from(rows[0].emb).length));
@@ -426,7 +435,7 @@ check("every body is iv(12) + tag(16) + ciphertext", rows.every((r) => Buffer.fr
 check("the mode is recorded in meta", readMeta("encrypted") === "true", String(readMeta("encrypted")));
 check("the operator is told the new mode", /now encrypted/.test(notices[notices.length - 1]?.text ?? ""), notices[notices.length - 1]?.text ?? "no notice");
 check("vectors stay in the clear, since encrypted content cannot be searched", rows.every((r) => Buffer.from(r.emb).length === 4096));
-const roundTrip = await call({ op: "surface", query: "Where the vault combination is kept. The surrounding work: an operator-only secret and the store that holds it." });
+const roundTrip = await call({ action: "surface", query: "Where the vault combination is kept. The surrounding work: an operator-only secret and the store that holds it." });
 check("the same memory surfaces as readable text afterwards", /vault combination/i.test(textOf(roundTrip)), textOf(roundTrip).slice(0, 200));
 
 // ── 7. mutations and batching ────────────────────────────────────────
@@ -435,8 +444,7 @@ const before = new DatabaseSync(DB, { readOnly: true });
 const n0 = Number(before.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
 before.close();
 
-const batch = await call({
-	op: "create",
+const batch = await mutate({
 	create: ["Batched memory one for the closeout test.", "Batched memory two for the closeout test."],
 	helpful: [{ id: "deadbeef", helpful: true }],
 	delete: [],
@@ -447,7 +455,7 @@ check("missing ids are explained to the model", /matched nothing/.test(textOf(ba
 const newIds = batch.details.report.created.map((c) => c.id);
 check("ids are 8 lowercase hex chars", newIds.every((id) => /^[0-9a-f]{8}$/.test(id)), newIds.join(","));
 
-const down = await call({ op: "helpful", helpful: [{ id: newIds[0], helpful: false }, { id: newIds[1], helpful: true }] });
+const down = await mutate({ helpful: [{ id: newIds[0], helpful: false }, { id: newIds[1], helpful: true }] });
 check("downvote and upvote both reported", down.details.report.votes.length === 2 && down.details.report.votes[0].delta < 0 && down.details.report.votes[1].delta > 0);
 const scores = new DatabaseSync(DB, { readOnly: true });
 const s0 = scores.prepare("SELECT score FROM memories WHERE id = ?").get(newIds[0]).score;
@@ -455,7 +463,7 @@ const s1 = scores.prepare("SELECT score FROM memories WHERE id = ?").get(newIds[
 scores.close();
 check("score moved down and up respectively", s0 < 0 && s1 > 0, `${s0} / ${s1}`);
 
-const del = await call({ op: "delete", delete: [newIds[0]] });
+const del = await mutate({ delete: [newIds[0]] });
 check("delete applied", del.details.report.deleted.length === 1);
 const casc = new DatabaseSync(DB, { readOnly: true });
 const n1 = Number(casc.prepare("SELECT COUNT(*) AS n FROM memories").get().n);
@@ -463,11 +471,11 @@ casc.close();
 check("row count is net +1 after create 2 / delete 1", n1 === n0 + 1, `${n0} -> ${n1}`);
 
 // A batch with one unknown id must delete nothing: every id is checked before the first write.
-const keeper = await call({ op: "create", create: ["A memory that must survive a failed batch delete."] });
+const keeper = await mutate({ create: ["A memory that must survive a failed batch delete."] });
 const keeperId = keeper.details.report.created[0].id;
 let batchErr = null;
 try {
-	await call({ op: "delete", delete: [keeperId, "ffffffff"] });
+	await mutate({ delete: [keeperId, "ffffffff"] });
 } catch (e) {
 	batchErr = e.message;
 }
@@ -476,7 +484,7 @@ const n2 = Number(afterBatch.prepare("SELECT COUNT(*) AS n FROM memories").get()
 afterBatch.close();
 check("a batch delete naming one unknown id throws", /no memory with id "ffffffff"/.test(batchErr ?? ""), batchErr ?? "no error");
 check("and deleted nothing on the way out", n2 === n1 + 1, `${n1} -> ${n2}`);
-await call({ op: "delete", delete: [keeperId] });
+await mutate({ delete: [keeperId] });
 
 // ── 8. failure paths propagate ───────────────────────────────────────
 section("[8] failure paths propagate instead of returning empty");
@@ -488,11 +496,17 @@ const throws = async (params, pattern) => {
 		return pattern.test(e.message) ? true : `wrong message: ${e.message}`;
 	}
 };
-check("surface without a query throws with guidance", (await throws({ op: "surface" }, /requires `query`/)) === true);
-check("edit on an unknown id throws", (await throws({ op: "edit", edit: [{ id: "ffffffff", text: "x" }] }, /no memory with id/)) === true);
-check("edit to empty text throws", (await throws({ op: "edit", edit: [{ id: newIds[1], text: "   " }] }, /was empty/)) === true);
-check("delete of an unknown id throws, not a silent no-op", (await throws({ op: "delete", delete: ["ffffffff"] }, /no memory with id/)) === true);
-check("a mutation op with no payload throws", (await throws({ op: "create" }, /applied nothing/)) === true);
+check("surface without a query throws with guidance", (await throws({ action: "surface" }, /requires `query`/)) === true);
+check("edit on an unknown id throws", (await throws({ action: "mutate", edit: [{ id: "ffffffff", text: "x" }] }, /no memory with id/)) === true);
+check("edit to empty text throws", (await throws({ action: "mutate", edit: [{ id: newIds[1], text: "   " }] }, /was empty/)) === true);
+check("delete of an unknown id throws, not a silent no-op", (await throws({ action: "mutate", delete: ["ffffffff"] }, /no memory with id/)) === true);
+check("a mutate call with no payload throws", (await throws({ action: "mutate" }, /applied nothing/)) === true);
+// Strict dispatch: a strayed argument is rejected, never ignored, never applied. The count is read
+// before and after, because the failure this guards against is a silent write.
+check("surface carrying mutation arrays is rejected", (await throws({ action: "surface", query: "x", helpful: [{ id: newIds[1], helpful: true }] }, /takes only `query`/)) === true);
+check("checkpoint carrying mutations is rejected", (await throws({ action: "checkpoint", create: ["strayed"] }, /takes no argument/)) === true);
+check("checkpoint carrying a query is rejected", (await throws({ action: "checkpoint", query: "strayed" }, /takes no argument/)) === true);
+check("a call with no action names nothing and throws", (await throws({}, /requires `action`/)) === true);
 const countRows = () => {
 	const h = new DatabaseSync(DB, { readOnly: true });
 	try {
@@ -501,8 +515,10 @@ const countRows = () => {
 		h.close();
 	}
 };
-check("create of only whitespace throws and stores nothing", (await throws({ op: "create", create: ["   "] }, /applied nothing/)) === true && countRows() === n1, `${countRows()} vs ${n1}`);
-const aborted = await tool.execute("c", { op: "surface", query: "x" }, AbortSignal.abort(), undefined, ctx).then(() => false, (e) => /aborted/.test(e.message));
+
+check("the rejected checkpoint call stored nothing", countRows() === n1, `${countRows()} vs ${n1}`);
+check("create of only whitespace throws and stores nothing", (await throws({ action: "mutate", create: ["   "] }, /applied nothing/)) === true && countRows() === n1, `${countRows()} vs ${n1}`);
+const aborted = await tool.execute("c", { action: "surface", query: "x" }, AbortSignal.abort(), undefined, ctx).then(() => false, (e) => /aborted/.test(e.message));
 check("an aborted signal throws before any network call", aborted === true);
 
 // ── 9. keyfile ───────────────────────────────────────────────────────
@@ -535,7 +551,7 @@ await fire("session_shutdown");
 check("shutdown is idempotent", true);
 let reopened = false;
 try {
-	await call({ op: "create", create: ["Reopened lazily after shutdown."] });
+	await mutate({ create: ["Reopened lazily after shutdown."] });
 	reopened = true;
 } catch {
 	reopened = false;
@@ -735,7 +751,7 @@ const goodDir = process.env.DURABLE_MEMORY_DIR;
 process.env.DURABLE_MEMORY_DIR = path.join(SCRATCH3, "node_modules", "some-package");
 let refused = false;
 try {
-	await call({ op: "surface", query: "a query that should never reach the network" });
+	await call({ action: "surface", query: "a query that should never reach the network" });
 } catch (e) {
 	refused = /node_modules/.test(e.message) && /would delete the store/.test(e.message);
 }
@@ -786,8 +802,7 @@ const restoreDir = (value) => {
 const localDir = process.env.DURABLE_MEMORY_DIR;
 process.env.DURABLE_MEMORY_DIR = GLOBAL_DIR;
 await fire("session_shutdown");
-const seeded = await call({
-	op: "create",
+const seeded = await mutate({
 	create: ["Deploy scripts must run against a clean checkout.", "Postgres migrations in this project run forward only, never down."],
 });
 check("the shared corpus was seeded", seeded.details.report.created.length === 2);
@@ -798,13 +813,13 @@ restoreDir(localDir);
 process.env.DURABLE_MEMORY_GLOBAL_DIR = GLOBAL_DIR;
 await fire("session_shutdown");
 // A local memory on the same topic, so both stores contribute and the labelling rule is exercised.
-await call({ op: "create", create: ["The deploy script needs a clean checkout, and its migrations only run forward."] });
-const mergedText = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+await mutate({ create: ["The deploy script needs a clean checkout, and its migrations only run forward."] });
+const mergedText = textOf(await call({ action: "surface", query: DEPLOY_QUERY }));
 check("both stores are searched and labelled", /\[global\]/.test(mergedText) && /\[local\]/.test(mergedText), mergedText.slice(0, 400));
 check("the shared corpus is found", /clean checkout/i.test(mergedText), mergedText.slice(0, 400));
 check("searching the global store did not write to it", globalSnapshot() === seededSnapshot, "global rows or meta changed");
 
-await call({ op: "create", create: ["A private memory written while a shared store was mounted."] });
+await mutate({ create: ["A private memory written while a shared store was mounted."] });
 check("a create went to the local store only", globalCount() === 2, `global rows: ${globalCount()}`);
 check("a read-only store refuses a direct write", (() => {
 	const ro = new MemoryStore(GLOBAL_DIR, { readOnly: true });
@@ -821,14 +836,14 @@ check("a read-only store refuses a direct write", (() => {
 // A corpus embedded with a different model cannot be searched, and must not be rewritten to fit.
 withGlobalMeta((handle) => handle.prepare("UPDATE meta SET v = 'some-other-model' WHERE k = 'embedder'").run());
 await fire("session_shutdown");
-const mismatched = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+const mismatched = textOf(await call({ action: "surface", query: DEPLOY_QUERY }));
 check("a mismatched corpus is skipped with its reason", /global store was skipped/.test(mismatched) && /not comparable/.test(mismatched), mismatched.slice(0, 300));
 check("the local store still answers", /\[1\] id: [0-9a-f]{8}/.test(mismatched) && !/No store could be searched/.test(mismatched), mismatched.slice(0, 300));
 check("and the mismatched corpus was left alone", withGlobalMeta((handle) => handle.prepare("SELECT k FROM meta WHERE k = 'golden'").get() === undefined));
 
 delete process.env.DURABLE_MEMORY_GLOBAL_DIR;
 await fire("session_shutdown");
-const soloAgain = textOf(await call({ op: "surface", query: DEPLOY_QUERY }));
+const soloAgain = textOf(await call({ action: "surface", query: DEPLOY_QUERY }));
 check("with the global store unmounted the labels disappear", !/\[local\]/.test(soloAgain) && !/\[global\]/.test(soloAgain), soloAgain.slice(0, 300));
 
 // ── 16. LEGACY STORE MIGRATION — temporary; cut with its section in ../index.ts ──
