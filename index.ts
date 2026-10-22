@@ -1,8 +1,14 @@
 /**
  * Registers the `durable_memory` tool — long-term memory across pi sessions — and the
- * `/durable-memory` command for configuration and status. A session opens with `op:
- * "surface"` (a distill of the work) and records each completed task with `op: "checkpoint"`, which returns
- * fixed checkpoint instructions (create/rate/edit) batched into one further call, also fired after a commit.
+ * `/durable-memory` command for configuration and status. A session opens with `action: "surface"`
+ * (a distill of the work) and records each completed task with `action: "checkpoint"`, which returns
+ * fixed checkpoint instructions (create/rate/edit) batched into one `action: "mutate"` call, also
+ * fired after a commit.
+ *
+ * `action` is a strict dispatcher — required, and each call may carry only the arguments that
+ * belong to its action; anything else is rejected rather than ignored or applied. So a write can
+ * only ever come from a call that said `mutate`, and a reply can only ever come from the action
+ * that owns it.
  *
  * Two stores can be active: the local one, always present and writable, and an optional global one
  * seeded out of band and merged into `surface` read-only. Mutations only ever reach the local store.
@@ -175,8 +181,9 @@ const VOTE_STEP = 0.5;
 const SCORE_WEIGHT = 0.05;
 const SCORE_INFLUENCE_CAP = 0.25;
 
-const OPS = ["surface", "checkpoint", "create", "edit", "delete", "helpful"] as const;
-type Op = (typeof OPS)[number];
+/** The action enum is the whole dispatch surface: retrieve, get instructions, write. */
+const ACTIONS = ["surface", "checkpoint", "mutate"] as const;
+type Action = (typeof ACTIONS)[number];
 
 /**
  * Returned verbatim on every `checkpoint` call. Task-scoped, not session-scoped: a model cannot
@@ -188,7 +195,8 @@ type Op = (typeof OPS)[number];
 const CHECKPOINT_MESSAGE = [
 	`${rule()} CHECKPOINT — RECORD WHAT YOU LEARNED ${rule()}`,
 	"",
-	"You just completed a unit of work. Batch the following into ONE call:",
+	"You just completed a unit of work. Batch the following into ONE `durable_memory` call with",
+	'`action: "mutate"`:',
 	"",
 	"1. `create` — facts no readable text supplies. One self-contained sentence per fact: a",
 	"   gnomic-present stative proposition — what IS, never what happened; events culminate and rot,",
@@ -216,17 +224,19 @@ const CHECKPOINT_MESSAGE = [
 	"",
 	"3. `edit` / `delete` — correct what is wrong, remove what is dead.",
 	"",
-	"`op` labels the call and selects nothing: every array in it applies, in the order delete, edit,",
-	"create, helpful.",
+	"`action` selects what a call does, and an argument that does not belong to it is rejected — so every",
+	"array above rides in the `mutate` call, applied in the order delete, edit, create, helpful:",
+	"delete first, so never delete and edit the same id in one call.",
 	"",
 	"Example:",
-	'   { "op": "create", "create": ["..."], "helpful": [{"id":"a1b2c3d4","helpful":true},{"id":"e5f6a7b8","helpful":false}] }',
+	'   { "action": "mutate", "create": ["..."], "helpful": [{"id":"a1b2c3d4","helpful":true},{"id":"e5f6a7b8","helpful":false}] }',
 	"",
 	"If there is nothing to send, send nothing — never another `checkpoint`, which returns this message",
-	"and records nothing. An `op` that applies nothing is rejected.",
+	"and records nothing, and never an empty `mutate`, which is rejected. Mutations sent with any other",
+	"action are rejected too — resend them as `action: \"mutate\"`.",
 	"",
-	"The next task begins with `surface`; call `checkpoint` again when it is complete, and after every",
-	"commit.",
+	"The next task begins with `action: \"surface\"`; call `action: \"checkpoint\"` again when it is complete,",
+	"and after every commit.",
 ].join("\n");
 
 function rule(width = 5): string {
@@ -922,7 +932,8 @@ function renderSurface(result: MergedSurface): string {
 	if (result.total === 0) {
 		lines.push("The durable memory store is empty. Nothing has been carried forward yet.");
 		lines.push("");
-		lines.push("Work the task. At the checkpoint, `create` the facts a future session would need.");
+		lines.push("Work the task. When it is complete, call `action: \"checkpoint\"`, then send the facts a future");
+		lines.push("session would need in one `action: \"mutate\"` call.");
 		lines.push(checkpointReminder());
 		return lines.join("\n");
 	}
@@ -939,7 +950,7 @@ function renderSurface(result: MergedSurface): string {
 		lines.push("the actual parts is what lets a memory about those parts be found.");
 		lines.push("");
 		lines.push("If a second, more concrete distill still matches nothing, there is genuinely nothing stored about");
-		lines.push("this work. Proceed, and at the checkpoint `create` the memories this session is producing.");
+		lines.push("this work. Proceed, and at the checkpoint send the memories this session is producing with `mutate`.");
 		lines.push(checkpointReminder());
 		return lines.join("\n");
 	}
@@ -974,7 +985,7 @@ function checkpointReminder(): string {
 		"",
 		rule(30),
 		`${MARK} WHEN THE TASK YOU SET OUT TO DO IS COMPLETE — OR AFTER A COMMIT — CALL`,
-		`${MARK} \`durable_memory\` WITH \`op: "checkpoint"\`. DO NOT DEFER IT TO THE END. DO NOT SKIP IT.`,
+		`${MARK} \`durable_memory\` WITH \`action: "checkpoint"\`. DO NOT DEFER IT TO THE END. DO NOT SKIP IT.`,
 		rule(30),
 	].join("\n");
 }
@@ -987,8 +998,6 @@ interface MutationReport {
 }
 
 const emptyReport = (): MutationReport => ({ created: [], edited: [], deleted: [], votes: [] });
-
-const hasMutations = (report: MutationReport): boolean => Object.values(report).some((a) => a.length > 0);
 
 function renderMutations(report: MutationReport): string {
 	const lines: string[] = [];
@@ -1014,18 +1023,20 @@ function renderMutations(report: MutationReport): string {
 // ── Tool ─────────────────────────────────────────────────────────────
 
 const PARAMS = Type.Object({
-	op: StringEnum(OPS, {
+	action: StringEnum(ACTIONS, {
 		description:
-			'"surface" retrieves memories matching a distill of the current work. "checkpoint" returns the recording ' +
-			"instructions for the task you just completed; it takes no other argument and repeats per task. The rest " +
-			"label the call and select nothing: every array you supply applies, in the order delete, edit, create, " +
-			"helpful — delete first, so never delete and edit the same id in one call. Ids are the full ids `surface` " +
-			"returned; a prefix or unknown id is an error.",
+			'"surface" retrieves memories matching a distill of the current work; it takes `query` and nothing ' +
+			"else. \"checkpoint\" returns the recording instructions for the task you just completed; it takes " +
+			"no argument. \"mutate\" applies the mutation arrays — every array you supply, in the order delete, " +
+			"edit, create, helpful; delete first, so never delete and edit the same id in one call. An argument " +
+			"that does not belong to the named action is rejected — never silently ignored, never silently " +
+			"applied. " +
+			"Ids are the full ids `surface` returned; a prefix or unknown id is an error.",
 	}),
 	query: Type.Optional(
 		Type.String({
 			description:
-				'Required for op "surface". A distill of the work you are about to do, in one to three sentences — as ' +
+				'Required for action "surface". A distill of the work you are about to do, in one to three sentences — as ' +
 				"many as the work needs, no more. Name the task, the constraint you are working under, and what a good " +
 				"outcome looks like, and name the concrete subsystem, files, services, or mechanisms you are about to " +
 				'touch and how they fit together. A line starting "The surrounding work:" helps but is not required. ' +
@@ -1066,22 +1077,22 @@ const PARAMS = Type.Object({
 const DESCRIPTION = [
 	"Long-term memory that persists across sessions, searched by embedding similarity and optionally encrypted at rest.",
 	"",
-	'op "surface" takes `query` — a distill of the work, shaped as the parameter description specifies — and returns what',
-	"no readable text supplies.",
-	"",
-	'op "checkpoint" takes nothing and returns the recording instructions for one completed task — not for the session.',
-	"The other four store, correct, remove, and rate.",
+	"`action` selects what a call does — required, and every argument must belong to it:",
+	'	"surface" takes `query` — a distill of the work, shaped as the parameter description specifies — and returns',
+	"	what no readable text supplies.",
+	'	"checkpoint" takes nothing and returns the recording instructions for one completed task — not for the session.',
+	'	"mutate" takes the mutation arrays (delete, edit, create, helpful) and applies them in that order.',
 ].join("\n");
 
 interface ToolDetails {
-	op: string;
+	action: string;
 	hits?: SurfaceHit[];
 	report: MutationReport;
 }
 
-const toolResult = (op: string, report: MutationReport, text: string, extra?: Partial<ToolDetails>): AgentToolResult<ToolDetails> => ({
+const toolResult = (action: string, report: MutationReport, text: string, extra?: Partial<ToolDetails>): AgentToolResult<ToolDetails> => ({
 	content: [{ type: "text", text }],
-	details: { op, report, ...extra },
+	details: { action, report, ...extra },
 });
 
 // ── Extension ────────────────────────────────────────────────────────
@@ -1111,12 +1122,10 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	const openStore = (): MemoryStore => openStores().local;
 
 	/**
-	 * Applies every mutation array present, in a fixed order. Runs for any `op`, including
-	 * `surface` and `checkpoint` — deliberately: observed live, a model that called `checkpoint` twice
-	 * (ratings on the first, creates on the second) still had both stored because the payload
-	 * is read independently of `op`. Gating on op would turn that into silent data loss.
-	 *
-	 * Mutations always target the local store; the global one is not writable.
+	 * Applies every mutation array present, in a fixed order, to the local store — the global one is
+	 * not writable. Called only from the `mutate` branch: `action` dispatches strictly, so an array can
+	 * only ever be applied by a call that named `mutate`. The order is delete, edit, create, helpful
+	 * so a call can never half-apply a delete-and-edit of the same id.
 	 */
 	async function applyMutations(
 		params: {
@@ -1147,14 +1156,14 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		description: DESCRIPTION,
 		promptSnippet: "Cross-session memory; surface early and often, close out each task",
 		promptGuidelines: [
-			"If you have not yet called `durable_memory` with `op: \"surface\"` in this conversation, call it before your " +
+			"If you have not yet called `durable_memory` with `action: \"surface\"` in this conversation, call it before your " +
 				"first edit, write, or command that changes state. Reading files first and speaking with the user is fine " +
 				"and expected — surface before you act, not before you look. Check your own transcript for a previous " +
 				"`durable_memory` call rather than judging whether you feel oriented.",
 			"Surface is not a one-time check — it is a habit across the session. Call `durable_memory` with " +
-				'`op: "surface"` again whenever the work pivots to a different subsystem, file, or mechanism than the ' +
+				'`action: "surface"` again whenever the work pivots to a different subsystem, file, or mechanism than the ' +
 				"one you last surfaced for, and whenever a new task begins.",
-			"When you complete a task or commit, call `durable_memory` with `op: \"checkpoint\"` before reporting " +
+			"When you complete a task or commit, call `durable_memory` with `action: \"checkpoint\"` before reporting " +
 				"the result — even if the session continues. Check your transcript for a `checkpoint` call after that " +
 				"task or commit rather than waiting for the session to end, which is not something you can observe.",
 		],
@@ -1163,35 +1172,56 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (signal?.aborted) throw new Error("durable_memory call was aborted.");
 			const sessionId = ctx.sessionManager.getSessionId();
-
-			const report = await applyMutations(params, sessionId, signal);
-			const dbg = log();
-			if (dbg && report.votes.length) dbg.logVotes(sessionId, report.votes);
-			// A mutation op that applied nothing is a malformed call — reject it, don't render it.
-			if (params.op !== "surface" && params.op !== "checkpoint" && !hasMutations(report)) {
-				throw new Error(
-					`op "${params.op}" applied nothing — supply at least one well-formed mutation array ` +
-						"(delete, edit, create, helpful).",
-				);
+			// The schema marks `action` required, but the harness does not enforce required fields before
+			// execute runs — so this gate is what actually holds. A call with no action names nothing.
+			const action = params.action as Action | undefined;
+			if (!action) {
+				throw new Error("durable_memory requires `action` — one of surface, checkpoint, mutate. " +
+					"Arguments select nothing on their own.");
 			}
 
-			if (params.op === "checkpoint") {
-				return toolResult("checkpoint", report, CHECKPOINT_MESSAGE);
+			// Strict dispatch: an argument that does not belong to the named action is rejected, never ignored
+			// and never applied. This is the boundary that keeps a reply-only call (checkpoint) from
+			// silently carrying writes, and keeps a search (surface) from silently carrying ratings.
+			const mutationCount =
+				(params.delete?.length ?? 0) + (params.edit?.length ?? 0) +
+				(params.create?.length ?? 0) + (params.helpful?.length ?? 0);
+			if (action === "surface" && mutationCount > 0) {
+				throw new Error('action "surface" takes only `query` — mutation arrays are rejected here. ' +
+					'Resend them with action "mutate".');
+			}
+			if (action === "checkpoint" && (mutationCount > 0 || params.query)) {
+				throw new Error('action "checkpoint" takes no argument. Mutations are sent with action "mutate"; ' +
+					'a distill with action "surface".');
 			}
 
-			if (params.op === "surface") {
+			if (action === "checkpoint") {
+				return toolResult("checkpoint", emptyReport(), CHECKPOINT_MESSAGE);
+			}
+
+			if (action === "surface") {
 				const query = params.query?.trim();
-				if (!query) throw new Error('op "surface" requires `query`: a distill of the work (one to three sentences).');
+				if (!query) throw new Error('action "surface" requires `query`: a distill of the work (one to three sentences).');
 				const merged = await searchStores(openStores(), query, signal);
 				surfaceCalls++;
-				dbg?.logSurface(sessionId, query, merged);
-
-				const lines = [renderSurface(merged)];
-				if (hasMutations(report)) lines.push("", "Applied in the same call:", renderMutations(report));
-				return toolResult("surface", report, lines.join("\n"), { hits: merged.hits });
+				log()?.logSurface(sessionId, query, merged);
+				return toolResult("surface", emptyReport(), renderSurface(merged), { hits: merged.hits });
 			}
 
-			return toolResult(params.op, report, renderMutations(report));
+			if (mutationCount === 0) {
+				throw new Error('action "mutate" applied nothing — supply at least one well-formed mutation array ' +
+					"(delete, edit, create, helpful).");
+			}
+			const report = await applyMutations(params, sessionId, signal);
+			// The pre-gate counts arrays; this one counts effects — a create of only whitespace has
+			// nothing to show for its arrays, and a silent empty report is worse than an error.
+			if (!Object.values(report).some((a) => a.length > 0)) {
+				throw new Error('action "mutate" applied nothing — supply at least one well-formed mutation array ' +
+					"(delete, edit, create, helpful).");
+			}
+			const dbg = log();
+			if (dbg && report.votes.length) dbg.logVotes(sessionId, report.votes);
+			return toolResult("mutate", report, renderMutations(report));
 		},
 	};
 
