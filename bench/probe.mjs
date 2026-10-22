@@ -81,9 +81,11 @@ if (!process.env.DURABLE_MEMORY_EMBED_KEY) {
 if (!process.env.DURABLE_MEMORY_EMBED_KEY) throw new Error("no embedding credential found; set DURABLE_MEMORY_EMBED_KEY");
 const SRC = path.join(SCRATCH, "index.ts");
 fs.copyFileSync(path.join(PKG, "index.ts"), SRC);
-// package.json rides along: the release-notes announcement reads its version from beside the module,
-// exactly as a real install lays the files out.
+// package.json and release-notes.json ride along: the release-notes announcement reads both from
+// beside the module, exactly as a real install lays the files out.
 fs.copyFileSync(path.join(PKG, "package.json"), path.join(SCRATCH, "package.json"));
+fs.copyFileSync(path.join(PKG, "release-notes.json"), path.join(SCRATCH, "release-notes.json"));
+check("release notes live in a json file beside index.ts, not in index.ts itself", fs.existsSync(path.join(PKG, "release-notes.json")) && !/RELEASE_NOTES: Record<string, string> = \{\s*"/.test(fs.readFileSync(path.join(PKG, "index.ts"), "utf8")));
 const PROBE_STORE = path.join(AGENT, "durable-memory");
 
 const jiti = createJiti(import.meta.url, {
@@ -153,38 +155,51 @@ check("the description names all six ops", ["surface", "checkpoint"].every((o) =
 await fire("session_start");
 
 // ── 1b. release notes: the first two interactive loads per installed version ─────
-section("[1b] release notes announce on the first two loads per version");
+section("[1b] release notes announce on the first two loads per version, without skipping a release");
 const VERSION = JSON.parse(fs.readFileSync(path.join(SCRATCH, "package.json"), "utf8")).version;
-const noteNotices = () => notices.filter((n) => n.text.startsWith(`pi-durable-memory ${VERSION}`));
+const noteNotices = (v) => notices.filter((n) => n.text.startsWith(`pi-durable-memory ${v ?? VERSION}`));
 const announcedState = () => fs.readFileSync(path.join(PROBE_STORE, "announced.txt"), "utf8");
 check(
-	"announces the installed version's notes on the first session start",
-	noteNotices().length === 1 && /significantly improved/.test(noteNotices()[0].text) && /delete your existing memory SQLite store/.test(noteNotices()[0].text),
-	String(noteNotices().length),
+	"the first session start announces the current version's short note",
+	noteNotices().length === 1 && /changelog: added an optional debug toggle/.test(noteNotices()[0].text),
+	noteNotices().map((n) => n.text.slice(0, 80)).join(" | "),
 );
 check(
-	"the note carries the regeneration command and the settings reassurance",
-	/rm ~\/\.pi\/agent\/durable-memory\/memory\.db\*/.test(noteNotices()[0].text) && /config\.json is untouched/i.test(noteNotices()[0].text),
+	"the first session start also delivers the 0.4.1 flush note to a fresh install",
+	noteNotices("0.4.1").length === 1 && /delete your existing memory SQLite store/.test(noteNotices("0.4.1")[0].text),
+	noteNotices("0.4.1").map((n) => n.text.slice(0, 80)).join(" | "),
 );
 check(
-	"the note offers the rename-and-carry-forward alternative to deletion",
-	/temporarily rename the old memory db/.test(noteNotices()[0].text) && /cherry-pick out the best memories/.test(noteNotices()[0].text),
+	"the flush note carries the regeneration command and the settings reassurance",
+	/rm ~\/\.pi\/agent\/durable-memory\/memory\.db\*/.test(noteNotices("0.4.1")[0].text) && /config\.json is untouched/i.test(noteNotices("0.4.1")[0].text),
 );
-check("records the version and show count in the store directory", announcedState() === `${VERSION} 1`);
+check("each version carries its own show count", announcedState() === `0.4.1 1\n0.4.2 1\n`, JSON.stringify(announcedState()));
 await fire("session_start");
-check("a second session start announces the note once more", noteNotices().length === 2 && announcedState() === `${VERSION} 2`);
+check("a second session start announces each note once more", noteNotices().length === 2 && noteNotices("0.4.1").length === 2);
+check("the per-version counts advance to two", announcedState() === `0.4.1 2\n0.4.2 2\n`, JSON.stringify(announcedState()));
 await fire("session_start");
-check("a third session start does not announce again", noteNotices().length === 2);
+check("a third session start announces nothing", noteNotices().length === 2 && noteNotices("0.4.1").length === 2);
 fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.0.0 2");
 await (captured.handlers.get("session_start") ?? [])[0]?.({ type: "session_start" }, { ...ctx, hasUI: false });
 check(
 	"a headless run announces nothing and leaves the marker untouched",
-	announcedState() === "0.0.0 2" && noteNotices().length === 2,
+	announcedState() === "0.0.0 2" && noteNotices().length === 2 && noteNotices("0.4.1").length === 2,
 );
+// The upgrade-without-skipping case: a user who already saw the 0.4.1 note must not see it again.
+fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.4.1 2");
 await fire("session_start");
 check(
-	"the next interactive session start announces a pending version from its first show",
-	noteNotices().length === 3 && announcedState() === `${VERSION} 1`,
+	"a user current through 0.4.1 sees only the new note",
+	noteNotices().length === 3 && noteNotices("0.4.1").length === 2 && announcedState() === `0.4.1 2\n0.4.2 1\n`,
+	JSON.stringify(announcedState()),
+);
+// The skipped-release case: a user on 0.4.0 still gets the flush note when they install 0.4.2.
+fs.writeFileSync(path.join(PROBE_STORE, "announced.txt"), "0.4.0 2");
+await fire("session_start");
+check(
+	"a user who skipped 0.4.1 still gets the flush note",
+	noteNotices("0.4.1").length === 3 && /delete your existing memory SQLite store/.test(noteNotices("0.4.1")[2].text),
+	noteNotices("0.4.1").map((n, i) => `${i}:${n.text.slice(0, 40)}`).join(" | "),
 );
 
 // ── 2. checkpoint is a static push alert ─────────────────────────────────
@@ -323,6 +338,43 @@ check("keeps the re-surface trigger for a result that already matched", /even if
 	walk(tool.parameters);
 	check("no schema property lets the model supply a session", !propNames.some((p) => /session/i.test(p)), propNames.join(","));
 }
+
+// ── 5b. debug logging of surface queries ──────────────────────────
+section("[5b] debug logging: off by default, on via DURABLE_MEMORY_DEBUG or config");
+const DEBUG_DB = path.join(mod.DEFAULT_STORE_DIR, "surface-log.db");
+check("debug defaults to off", mod.resolveSettings().debug === false, JSON.stringify(mod.resolveSettings().debug));
+check("surface calls while off wrote no debug log", !fs.existsSync(DEBUG_DB));
+process.env.DURABLE_MEMORY_DEBUG = "1";
+check("DURABLE_MEMORY_DEBUG=1 turns debug on", mod.resolveSettings().debug === true);
+const dbgQuery = `${corpus[0].query}\n\nThe surrounding work: ${corpus[0].synopsis}`;
+const dbgResult = await call({ op: "surface", query: dbgQuery });
+const dbgHits = dbgResult.details.hits ?? [];
+const dbgHitId = dbgHits[0]?.id;
+await call({ op: "helpful", helpful: [{ id: dbgHitId, helpful: true }] });
+check("the debug log exists once debug is on", fs.existsSync(DEBUG_DB), DEBUG_DB);
+const dbg = new DatabaseSync(DEBUG_DB, { readOnly: true });
+try {
+	const q = dbg.prepare("SELECT session, query, total FROM surface_queries ORDER BY id DESC LIMIT 1").get();
+	check("the query row holds the session, text, and store total", q && q.session === SESSION && q.query === dbgQuery && q.total >= corpus.length, JSON.stringify(q)?.slice(0, 200));
+	const hits = dbg.prepare("SELECT position, hit_id, similarity, text FROM surface_hits WHERE query_id = (SELECT MAX(id) FROM surface_queries) ORDER BY position").all();
+	check("every returned hit is logged in ranked order", hits.length === dbgHits.length && hits.every((h, i) => h.hit_id === dbgHits[i].id && h.position === i + 1), JSON.stringify(hits.map((h) => [h.position, h.hit_id])));
+	check("hit text is logged in plaintext, not encrypted", hits.length === 0 || corpus.some((m) => hits.some((h) => h.text.includes(m.memory.slice(0, 40)))), (hits[0]?.text ?? "").slice(0, 120));
+	const vote = dbg.prepare("SELECT session, hit_id, helpful FROM surface_votes ORDER BY ts DESC LIMIT 1").get();
+	check("the rating is logged against the surfaced id", vote && vote.session === SESSION && vote.hit_id === dbgHitId && vote.helpful === 1, JSON.stringify(vote));
+} finally {
+	dbg.close();
+}
+delete process.env.DURABLE_MEMORY_DEBUG;
+const dbgAfter = await call({ op: "surface", query: corpus[1].query });
+const dbgCount = () => {
+	const h = new DatabaseSync(DEBUG_DB, { readOnly: true });
+	try {
+		return Number(h.prepare("SELECT COUNT(*) AS n FROM surface_queries").get().n);
+	} finally {
+		h.close();
+	}
+};
+check("turning debug back off stops the logging", dbgCount() === 1, `logged ${dbgCount()} queries for 2 surface calls, only the one made while on`);
 
 // ── 6. encryption at rest ────────────────────────────────────────────
 section("[6] encryption is opt-in, and switching it on round-trips every body");
@@ -503,7 +555,7 @@ fs.rmSync(CONFIG, { force: true });
 const pre = mod.readSettings();
 check(
 	"a missing config prefills the defaults on read",
-	pre.endpoint === "remote" && pre.model === "emb-qwen3" && pre.storeDir === mod.DEFAULT_STORE_DIR,
+	pre.endpoint === "remote" && pre.model === "emb-qwen3" && pre.storeDir === mod.DEFAULT_STORE_DIR && pre.debug === false,
 	JSON.stringify(pre),
 );
 check("the prefill names no url, so the endpoint's preset applies", pre.url === undefined, JSON.stringify(pre));
@@ -545,6 +597,18 @@ check("with no file the defaults apply and the file is recreated", (() => {
 // config written by an earlier version, which stored the preset explicitly.
 fs.writeFileSync(CONFIG, JSON.stringify({ endpoint: "remote", url: "https://gw.lunaroute.com/v1/embeddings" }), { mode: 0o600 });
 check("a stored preset url is not an override", mod.resolveSettings().urlOverridden === false, JSON.stringify(mod.readSettings()));
+check("debug true is read from the settings file", (() => {
+	fs.writeFileSync(CONFIG, JSON.stringify({ debug: true }), { mode: 0o600 });
+	return mod.resolveSettings().debug === true;
+})());
+let badDebug = false;
+try {
+	fs.writeFileSync(CONFIG, JSON.stringify({ debug: "yes" }), { mode: 0o600 });
+	mod.readSettings();
+} catch (e) {
+	badDebug = /"debug" must be true or false/.test(e.message);
+}
+check("a non-boolean debug value fails loudly", badDebug);
 
 // A malformed settings file must fail loudly rather than silently reverting to defaults.
 fs.writeFileSync(CONFIG, "{ not json", { mode: 0o600 });

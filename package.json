@@ -1,6 +1,6 @@
 {
   "name": "@taylorsatula/pi-durable-memory",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Proper long-term memory for Pi. These are not crude MEMORY.md files. Each memory is stored individually and the agent curates them. Memories are injected into the context window for just-in-time recall. Local SQLite, embedding search.",
   "keywords": [
     "pi-package",

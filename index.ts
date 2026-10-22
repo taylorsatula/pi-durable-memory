@@ -47,9 +47,10 @@ const DEFAULTS = {
 	endpoint: "remote" as Endpoint,
 	model: "emb-qwen3",
 	storeDir: DEFAULT_STORE_DIR,
+	debug: false,
 } satisfies Settings;
 
-const KEYS = ["endpoint", "url", "model", "apiKey", "storeDir", "globalStoreDir"] as const;
+const KEYS = ["endpoint", "url", "model", "apiKey", "storeDir", "globalStoreDir", "debug"] as const;
 type Key = (typeof KEYS)[number];
 
 interface Settings {
@@ -59,6 +60,8 @@ interface Settings {
 	apiKey?: string;
 	storeDir?: string;
 	globalStoreDir?: string;
+	/** Off by default; on, every surface query, its hits, and every rating land in a separate debug db. */
+	debug?: boolean;
 }
 
 /** Settings with every default filled in — the shape the file has once prefilled. */
@@ -75,10 +78,17 @@ function checkedSettings(parsed: unknown): Settings {
 	if (unknown.length) {
 		throw new Error(`${CONFIG_PATH}: unknown setting${unknown.length === 1 ? "" : "s"} ${unknown.join(", ")}.`);
 	}
-	const out: Record<string, string> = {};
+	const out: Record<string, string | boolean> = {};
 	for (const key of KEYS) {
 		const value = raw[key];
 		if (value === undefined) continue; // absent means "take the default", not "clear it"
+		if (key === "debug") {
+			if (typeof value !== "boolean") {
+				throw new Error(`${CONFIG_PATH}: "debug" must be true or false, got ${typeof value}.`);
+			}
+			out.debug = value;
+			continue;
+		}
 		if (typeof value !== "string") throw new Error(`${CONFIG_PATH}: "${key}" must be a string, got ${typeof value}.`);
 		out[key] = value;
 	}
@@ -137,6 +147,7 @@ function resolveSettings() {
 		keySource: fromEnv ? "env" : s.apiKey ? "config" : "none",
 		storeDir: assertStoreDir(process.env.DURABLE_MEMORY_DIR ?? s.storeDir),
 		globalStoreDir: globalDir ? assertStoreDir(globalDir) : undefined,
+		debug: s.debug === true || process.env.DURABLE_MEMORY_DEBUG === "1",
 	};
 }
 
@@ -225,64 +236,42 @@ function rule(width = 5): string {
 // ── Release notes ───────────────────────────────────────────────
 
 /**
- * Per-version notes pushed to the user on the session starts after an update. Keyed by the
- * package version — `announced.txt` in the store directory records the version and how many
- * times its note has been shown, so each note fires on the first two interactive loads of an
- * install, then never again for that version.
+ * Per-version notes pushed to the user on the session starts after that version installs. Keyed by
+ * package version — `announced.txt` records a show count per version, so skipping a release still
+ * delivers its note, and a delivered note never fires again.
+ *
+ * The notes live in release-notes.json beside index.ts, so index.ts does not bloat as notes
+ * accumulate across releases. A load with no file beside it (a vendored copy of index.ts alone)
+ * announces nothing; a file that is present but malformed fails loudly rather than announcing
+ * nothing silently.
  */
-const RELEASE_NOTES: Record<string, string> = {
-	"0.4.1": [
-		"The memory prompt has been significantly improved — and it will be iteratively improved more over time.",
-		"",
-		"This release rewrites the instructions that guide what the agent saves to memory — the memory",
-		"prompt — from scratch. We analyzed a real corpus of 139 memories written under the old",
-		"instructions and found recurring problems: session reports ('we rewrote X today') instead of",
-		"durable facts; raw numbers from one-off passes; literal duplicates; stale entries contradicted",
-		"by newer ones that were never removed; and many facts already written in project files, docs,",
-		"or the tool's own built-in instructions — material the agent re-reads every session anyway.",
-		"None of these help a future session, and every memory search had to fight through them.",
-		"",
-		"The new instructions are simple and strict: save only what a future session could not get from",
-		"any file, doc, or built-in instruction; write each memory as a single self-contained sentence",
-		"stating something that IS true, not a report of what happened once; open with where it matters",
-		"(the file, command, or decision it concerns); use exact names, paths, and error text rather than",
-		"vague categories; never save a second copy of something already stored; and state the concrete",
-		"check that would reveal when the memory has gone stale. The result: future memory searches",
-		"return fewer, better entries.",
-		"",
-		"Entries written under the old instructions mix into every search result. Due to this jump, if",
-		"possible, delete your existing memory SQLite store and let the memories regenerate:",
-		"",
-		"    rm ~/.pi/agent/durable-memory/memory.db*",
-		"",
-		"Your config.json is untouched, and the store recreates itself on the next start — fresh",
-		"memories will accumulate naturally over future sessions.",
-		"",
-		"Alternatively, rather than deleting, a coding agent can temporarily rename the old memory db,",
-		"read the new directive, then load the old SQLite and cherry-pick out the best memories to reword",
-		"and carry forward into the fresh store.",
-		"",
-		"This will not likely be the case on each release — but during these early releases there are drastic",
-		"improvements in memory quality.",
-	].join("\n"),
-};
-
-/**
- * package.json sits beside index.ts in both the dev repo and the installed package. A load with no
- * manifest beside it (a vendored copy of the file) announces nothing — "unknown" matches no entry.
- */
-function packageVersion(): string {
-	try {
-		const manifest = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8")) as {
-			version?: string;
-		};
-		return manifest.version ?? "unknown";
-	} catch {
-		return "unknown";
+const RELEASE_NOTES: Record<string, string> = (() => {
+	const notesPath = new URL("./release-notes.json", import.meta.url);
+	if (!fs.existsSync(notesPath)) return {};
+	const parsed: unknown = JSON.parse(fs.readFileSync(notesPath, "utf8"));
+	if (typeof parsed !== "object" || parsed === null) {
+		throw new Error(`release-notes.json: expected a JSON object of version -> note.`);
 	}
+	for (const [version, note] of Object.entries(parsed)) {
+		if (typeof note !== "string") {
+			throw new Error(`release-notes.json: the note for "${version}" must be a string, got ${typeof note}.`);
+		}
+	}
+	return Object.fromEntries(Object.entries(parsed) as Array<[string, string]>);
+})();
+
+/** Orders dotted numeric versions ascending; anything unparsable sorts last, and notes never name one. */
+function compareVersions(a: string, b: string): number {
+	const pad = (s: string) => s.split(".").map((n) => Number(n) || 0);
+	const [x, y] = [pad(a), pad(b)];
+	for (let i = 0; i < Math.max(x.length, y.length); i++) {
+		const d = (x[i] ?? 0) - (y[i] ?? 0);
+		if (d) return d;
+	}
+	return 0;
 }
 
-/** The last version whose notes were shown and how many times ("0.4.0 2"), beside config.json. */
+/** Per-version show counts ("0.4.1 2\n0.4.2 1"), beside config.json. A single line from an older release still parses. */
 const ANNOUNCED_PATH = path.join(DEFAULT_STORE_DIR, "announced.txt");
 
 /** A session-start toast is easy to miss once, so a version's note shows on the first two interactive loads. */
@@ -775,6 +764,96 @@ function parseStamps(raw: string): string[] {
 	}
 }
 
+// ── Surface debug log ───────────────────────────────────────────────
+
+/** Beside config.json, so the log stays put even when the memory store moves. */
+const DEBUG_DB_PATH = path.join(DEFAULT_STORE_DIR, "surface-log.db");
+
+/**
+ * Off-by-default instrument for judging surface behavior: every `surface` query with the hits it
+ * returned, and every rating against the surfaced ids. Read raw with sqlite3 — the corpus that
+ * answers "is the model writing smart distills, and does the prompt give good direction?".
+ *
+ * Deliberately outside the memory store and always plaintext: it is a debug artifact, not data —
+ * never migrated, never encrypted, deleted whenever the study is done.
+ */
+class SurfaceLog {
+	private db: DatabaseSync;
+
+	constructor() {
+		fs.mkdirSync(DEFAULT_STORE_DIR, { recursive: true, mode: 0o700 });
+		this.db = new DatabaseSync(DEBUG_DB_PATH);
+		this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;");
+		this.db.exec(`
+			CREATE TABLE IF NOT EXISTS surface_queries (
+				id        INTEGER PRIMARY KEY AUTOINCREMENT,
+				ts        INTEGER NOT NULL,
+				session   TEXT NOT NULL,
+				query     TEXT NOT NULL,
+				total     INTEGER NOT NULL,
+				best_miss REAL NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS surface_hits (
+				query_id    INTEGER NOT NULL REFERENCES surface_queries(id),
+				position    INTEGER NOT NULL,
+				hit_id      TEXT NOT NULL,
+				similarity  REAL NOT NULL,
+				helpfulness REAL NOT NULL,
+				rank        REAL NOT NULL,
+				text        TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS surface_votes (
+				ts      INTEGER NOT NULL,
+				session TEXT NOT NULL,
+				hit_id  TEXT NOT NULL,
+				helpful INTEGER NOT NULL
+			);
+		`);
+	}
+
+	/** One row per query, one per returned hit — `helpfulness` as it stood at surface time, so a later rating shows as a delta. */
+	logSurface(session: string, query: string, merged: MergedSurface): void {
+		const ts = Date.now();
+		this.db.exec("BEGIN");
+		try {
+			const info = this.db
+				.prepare("INSERT INTO surface_queries (ts, session, query, total, best_miss) VALUES (?, ?, ?, ?, ?)")
+				.run(ts, session, query, merged.total, merged.bestMiss);
+			const queryId = Number(info.lastInsertRowid);
+			const hit = this.db.prepare(
+				"INSERT INTO surface_hits (query_id, position, hit_id, similarity, helpfulness, rank, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			);
+			merged.hits.forEach((h, i) => hit.run(queryId, i + 1, h.id, h.similarity, h.score, h.rank, h.text));
+			this.db.exec("COMMIT");
+		} catch (err) {
+			this.db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
+	/** Ratings arrive in later calls than the query they answer; the join is on hit_id across tables. */
+	logVotes(session: string, votes: Array<{ id: string; delta: number }>): void {
+		const ts = Date.now();
+		const stmt = this.db.prepare("INSERT INTO surface_votes (ts, session, hit_id, helpful) VALUES (?, ?, ?, ?)");
+		this.db.exec("BEGIN");
+		try {
+			for (const v of votes) stmt.run(ts, session, v.id, v.delta > 0 ? 1 : 0);
+			this.db.exec("COMMIT");
+		} catch (err) {
+			this.db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
+	close(): void {
+		try {
+			this.db.close();
+		} catch {
+			// Same exits as the memory store's close.
+		}
+	}
+}
+
 // ── Result formatting ────────────────────────────────────────────────
 
 interface SurfaceResult {
@@ -1010,6 +1089,13 @@ const toolResult = (op: string, report: MutationReport, text: string, extra?: Pa
 export default function durableMemoryExtension(pi: ExtensionAPI) {
 	let store: Stores | undefined;
 	let surfaceCalls = 0;
+	let debugLog: SurfaceLog | undefined;
+
+	const log = (): SurfaceLog | undefined => {
+		if (!resolveSettings().debug) return undefined;
+		debugLog ??= new SurfaceLog();
+		return debugLog;
+	};
 
 	const openStores = (): Stores => {
 		if (store) return store;
@@ -1079,6 +1165,8 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			const sessionId = ctx.sessionManager.getSessionId();
 
 			const report = await applyMutations(params, sessionId, signal);
+			const dbg = log();
+			if (dbg && report.votes.length) dbg.logVotes(sessionId, report.votes);
 			// A mutation op that applied nothing is a malformed call — reject it, don't render it.
 			if (params.op !== "surface" && params.op !== "checkpoint" && !hasMutations(report)) {
 				throw new Error(
@@ -1096,6 +1184,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				if (!query) throw new Error('op "surface" requires `query`: a distill of the work (one to three sentences).');
 				const merged = await searchStores(openStores(), query, signal);
 				surfaceCalls++;
+				dbg?.logSurface(sessionId, query, merged);
 
 				const lines = [renderSurface(merged)];
 				if (hasMutations(report)) lines.push("", "Applied in the same call:", renderMutations(report));
@@ -1123,6 +1212,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				`auth key:  ${r.keySource}`,
 				`vectors:   ${local.embedder() ?? "none written yet"}`,
 				`encrypted: ${local.encrypted ? "yes" : "no"} (local store)`,
+				`debug:     ${r.debug ? `on — logging surface queries to ${DEBUG_DB_PATH}` : "off"}`,
 				`session:   ${ctx.sessionManager.getSessionId()}`,
 				`this session: ${surfaceCalls} surface call${surfaceCalls === 1 ? "" : "s"}`,
 			);
@@ -1144,6 +1234,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				["apiKey", `Auth key        ${r.apiKey ? `set (…${r.apiKey.slice(-4)})` : "not set"}`],
 				["storeDir", `Database dir    ${r.storeDir}`],
 				["encrypt", `Encryption      ${openStore().encrypted ? "encrypted" : "unencrypted"} (local)`],
+				["debug", `Debug logging   ${r.debug ? "on" : "off"}`],
 				["status", "Show status"],
 				["done", "Done"],
 			];
@@ -1158,6 +1249,12 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				} catch (err) {
 					ctx.ui.notify((err as Error).message, "error");
 				}
+				continue;
+			}
+
+			if (key === "debug") {
+				writeSettings({ ...s, debug: !r.debug });
+				ctx.ui.notify(`Debug logging is now ${!r.debug ? "on" : "off"}.`, "info");
 				continue;
 			}
 
@@ -1227,24 +1324,39 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		store?.local.close();
 		store?.global?.close();
 		store = undefined;
+		debugLog?.close();
+		debugLog = undefined;
 	};
 
 	/**
-	 * Announces this version's release notes on the first two interactive session starts after an
-	 * update, then never again for that version. The marker file holds "version shown-count" and
-	 * advances only when the note was actually shown — headless runs (notify is a no-op there)
-	 * leave it unwritten, and the next interactive session still sees the note.
+	 * Announces every version's notes on the first two interactive session starts after that version
+	 * installs, then never again for that version. Each version carries its own count in the marker
+	 * file, so a user who skipped an intermediate release still gets its note, and a user who already
+	 * saw one never sees it again when a newer note arrives. The marker advances only when a note was
+	 * actually shown — headless runs (notify is a no-op there) leave it unwritten, and the next
+	 * interactive session still sees the note.
 	 */
 	const announceReleaseNotes = (ctx: ExtensionContext): void => {
-		const version = packageVersion();
-		const notes = RELEASE_NOTES[version];
-		if (!notes || !ctx.hasUI) return;
-		const marker = fs.existsSync(ANNOUNCED_PATH) ? fs.readFileSync(ANNOUNCED_PATH, "utf8") : "";
-		const shown = marker.startsWith(`${version} `) ? Number(marker.split(" ")[1]) : 0;
-		if (shown >= ANNOUNCES_PER_VERSION) return;
-		fs.mkdirSync(DEFAULT_STORE_DIR, { recursive: true, mode: 0o700 });
-		fs.writeFileSync(ANNOUNCED_PATH, `${version} ${Number.isFinite(shown) ? shown + 1 : 1}`, { mode: 0o600 });
-		ctx.ui.notify(`pi-durable-memory ${version}\n${notes}`, "info");
+		if (!ctx.hasUI) return;
+		const counts = new Map(
+			(fs.existsSync(ANNOUNCED_PATH) ? fs.readFileSync(ANNOUNCED_PATH, "utf8") : "")
+				.split("\n")
+				.map((line) => line.trim().split(" "))
+				.filter((parts) => parts.length === 2 && parts[0] && Number.isFinite(Number(parts[1])))
+				.map((parts) => [parts[0], Number(parts[1])]),
+		);
+		for (const [version, note] of Object.entries(RELEASE_NOTES).sort(([a], [b]) => compareVersions(a, b))) {
+			const shown = counts.get(version) ?? 0;
+			if (shown >= ANNOUNCES_PER_VERSION) continue;
+			counts.set(version, shown + 1);
+			fs.mkdirSync(DEFAULT_STORE_DIR, { recursive: true, mode: 0o700 });
+			fs.writeFileSync(
+				ANNOUNCED_PATH,
+				[...counts.entries()].sort(([a], [b]) => compareVersions(a, b)).map(([v, n]) => `${v} ${n}`).join("\n") + "\n",
+				{ mode: 0o600 },
+			);
+			ctx.ui.notify(`pi-durable-memory ${version}\n${note}`, "info");
+		}
 	};
 
 	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
