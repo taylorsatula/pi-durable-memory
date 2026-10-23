@@ -24,6 +24,11 @@ The extension adds one tool, `durable_memory`, and one command, `/durable-memory
 - `checkpoint` returns a reminder to store what you learned and rate what you saw.
 - `create`, `edit`, `delete` manage memories.
 - `helpful` rates memories so more useful ones rank higher.
+- `ledger` takes file paths relative to the working directory and returns the one-line notes
+  earlier sessions left on each file.
+- `annotate` appends those notes: at each checkpoint the model writes one short sentence per file
+  it edited or wrote ("fixed the off-by-one introduced in a3f9c21"). Notes are keyed by repository
+  (its root commit) and path, never embedded, and appear only when `ledger` asks for the file.
 
 Memories live in `memory.db`, outside the package directory, so they survive `pi update`.
 
@@ -69,7 +74,8 @@ and run against a scratch store, never your own. `npm publish` runs the probe fi
 ## Known limits
 
 - No decay: old memories stay until deleted or down-rated.
-- Embeddings are stored in cleartext.
+- Embeddings and ledger file paths are stored in cleartext; note text follows the encryption setting.
+- The ledger is keyed by path, so a renamed file starts a fresh ledger.
 - Search scans all memories in memory; fine up to a few thousand.
 - Memories are global, not scoped per project.
 - A shared store is read-only: it can be searched, never written or re-embedded from here.
