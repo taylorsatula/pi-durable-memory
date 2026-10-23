@@ -10,10 +10,15 @@
  * only ever come from a call that said `mutate`, and a reply can only ever come from the action
  * that owns it.
  *
+ * Alongside the memories sits a per-file ledger: one short note per file a session edited or wrote,
+ * keyed by repository and relative path, never embedded, and read back only when `action: "ledger"` names
+ * the file.
+ *
  * Two stores can be active: the local one, always present and writable, and an optional global one
  * seeded out of band and merged into `surface` read-only. Mutations only ever reach the local store.
  */
 
+import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -181,8 +186,13 @@ const VOTE_STEP = 0.5;
 const SCORE_WEIGHT = 0.05;
 const SCORE_INFLUENCE_CAP = 0.25;
 
-/** The action enum is the whole dispatch surface: retrieve, get instructions, write. */
-const ACTIONS = ["surface", "checkpoint", "mutate"] as const;
+/** A ledger note is one short sentence; past this it is a commit message, and the commit already has one. */
+const NOTE_MAX = 200;
+/** A file touched every session grows without bound, so `ledger` shows the newest notes and counts the rest. */
+const LEDGER_TAIL = 20;
+
+/** The action enum is the whole dispatch surface: retrieve, get instructions, write, read a file's ledger. */
+const ACTIONS = ["surface", "checkpoint", "mutate", "ledger"] as const;
 type Action = (typeof ACTIONS)[number];
 
 /**
@@ -224,12 +234,18 @@ const CHECKPOINT_MESSAGE = [
 	"",
 	"3. `edit` / `delete` — correct what is wrong, remove what is dead.",
 	"",
+	"4. `annotate` — one `{path, note}` per file you edited or wrote since the last checkpoint, the path",
+	"   relative to the working directory. The note is one short sentence on how this work touched that",
+	'   file: "fixed the cursor off-by-one introduced in a3f9c21", "touched as part of feature wwvk".',
+	"   Notes are a per-file ledger read back by path, never a memory, so the event report the rule in 1",
+	"   forbids is exactly what a note is.",
+	"",
 	"`action` selects what a call does, and an argument that does not belong to it is rejected — so every",
-	"array above rides in the `mutate` call, applied in the order delete, edit, create, helpful:",
+	"array above rides in the `mutate` call, applied in the order delete, edit, create, annotate, helpful:",
 	"delete first, so never delete and edit the same id in one call.",
 	"",
 	"Example:",
-	'   { "action": "mutate", "create": ["..."], "helpful": [{"id":"a1b2c3d4","helpful":true},{"id":"e5f6a7b8","helpful":false}] }',
+	'   { "action": "mutate", "create": ["..."], "annotate": [{"path":"src/pager.ts","note":"..."}], "helpful": [{"id":"a1b2c3d4","helpful":true}] }',
 	"",
 	"If there is nothing to send, send nothing — never another `checkpoint`, which returns this message",
 	"and records nothing, and never an empty `mutate`, which is rejected. Mutations sent with any other",
@@ -492,6 +508,15 @@ export class MemoryStore {
 					updated_at INTEGER NOT NULL
 				);
 				CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+				CREATE TABLE IF NOT EXISTS annotations (
+					id         INTEGER PRIMARY KEY,
+					repo       TEXT NOT NULL,
+					path       TEXT NOT NULL,
+					body       BLOB NOT NULL,
+					session    TEXT NOT NULL,
+					created_at INTEGER NOT NULL
+				);
+				CREATE INDEX IF NOT EXISTS annotations_path ON annotations (repo, path, created_at);
 			`);
 			migrateLegacyStore(this.db, dir); // LEGACY MIGRATION — remove with its section
 		}
@@ -538,6 +563,12 @@ export class MemoryStore {
 
 	count(): number {
 		return Number(this.one<{ n: number | bigint }>("SELECT COUNT(*) AS n FROM memories")?.n ?? 0);
+	}
+
+	/** A seeded global store predates the ledger and may lack its table, so absence reads as zero. */
+	annotationCount(): number {
+		if (!this.one("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'annotations'")) return 0;
+		return Number(this.one<{ n: number | bigint }>("SELECT COUNT(*) AS n FROM annotations")?.n ?? 0);
 	}
 
 	/**
@@ -703,6 +734,13 @@ export class MemoryStore {
 				const text = wasEncrypted ? decrypt(key, row.body) : Buffer.from(row.body).toString("utf8");
 				update.run(target ? encrypt(key, text) : Buffer.from(text, "utf8"), row.id);
 			}
+			// Ledger notes are bodies too; their paths stay in the clear, like vectors, because lookup needs them.
+			const notes = this.all<{ id: number; body: Uint8Array }>("SELECT id, body FROM annotations");
+			const updateNote = this.db.prepare("UPDATE annotations SET body = ? WHERE id = ?");
+			for (const note of notes) {
+				const text = wasEncrypted ? decrypt(key, note.body) : Buffer.from(note.body).toString("utf8");
+				updateNote.run(target ? encrypt(key, text) : Buffer.from(text, "utf8"), note.id);
+			}
 			this.setMeta("encrypted", String(target));
 		});
 		this.encrypted = target;
@@ -722,6 +760,44 @@ export class MemoryStore {
 
 	private findById(id: string): MemoryRow | undefined {
 		return this.one<MemoryRow>("SELECT id, body, emb, score, sessions FROM memories WHERE id = ?", id);
+	}
+
+	/** Append-only: a ledger records how a file was touched, so a later note never rewrites an earlier one. */
+	annotate(repo: string, items: Array<{ path: string; note: string }>, sessionId: string): Array<{ path: string; note: string }> {
+		this.assertWritable();
+		// Every note is checked before anything is written, so a bad one cannot leave a half-applied batch.
+		const clean = items.map((item) => {
+			const note = item.note.trim();
+			if (!note) throw new Error(`annotate: the note for "${item.path}" was empty.`);
+			if (/[\r\n]/.test(note) || note.length > NOTE_MAX) {
+				throw new Error(`annotate: the note for "${item.path}" must be one line of at most ${NOTE_MAX} characters — one short sentence.`);
+			}
+			return { path: item.path, note };
+		});
+		const insert = this.db.prepare("INSERT INTO annotations (repo, path, body, session, created_at) VALUES (?, ?, ?, ?, ?)");
+		const now = Date.now();
+		return this.transaction(() => {
+			for (const item of clean) insert.run(repo, item.path, this.encode(item.note), sessionId, now);
+			return clean;
+		});
+	}
+
+	/** The newest LEDGER_TAIL notes for one file, returned oldest first so they read as a ledger. */
+	ledger(repo: string, file: string): LedgerFile {
+		const total = Number(
+			this.one<{ n: number | bigint }>("SELECT COUNT(*) AS n FROM annotations WHERE repo = ? AND path = ?", repo, file)?.n ?? 0,
+		);
+		const rows = this.all<{ body: Uint8Array; session: string; created_at: number }>(
+			"SELECT body, session, created_at FROM annotations WHERE repo = ? AND path = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+			repo,
+			file,
+			LEDGER_TAIL,
+		);
+		return {
+			path: file,
+			total,
+			notes: rows.reverse().map((r) => ({ note: this.decode(r.body), session: r.session, at: Number(r.created_at) })),
+		};
 	}
 
 	/** Embeds the query, scores every stored memory, decrypts the top-k. */
@@ -864,6 +940,71 @@ class SurfaceLog {
 	}
 }
 
+// ── Ledger ───────────────────────────────────────────────────────────
+
+interface LedgerFile {
+	path: string;
+	total: number;
+	notes: Array<{ note: string; session: string; at: number }>;
+}
+
+/** Where ledger paths are relative to, and the key that keeps one repository's `src/index.ts` from another's. */
+interface Repo {
+	key: string;
+	root: string;
+}
+
+function git(cwd: string, args: string[]): string | undefined {
+	try {
+		return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The root commit names a repository across clones, forks, and remote renames, where the remote URL
+ * and the checkout path do not. A repository with no commits yet, or a directory outside git, falls
+ * back to its path — notes there survive until it moves.
+ */
+function resolveRepo(cwd: string): Repo {
+	const root = git(cwd, ["rev-parse", "--show-toplevel"]);
+	if (!root) return { key: `dir:${path.resolve(cwd)}`, root: path.resolve(cwd) };
+	// A history with merged-in roots has several; sorted, the choice is stable.
+	const first = git(root, ["rev-list", "--max-parents=0", "HEAD"])?.split("\n").filter(Boolean).sort()[0];
+	return { key: first ? `git:${first}` : `dir:${root}`, root };
+}
+
+/** The model names files relative to its working directory; the ledger keys them relative to the repository root. */
+function ledgerPath(repo: Repo, cwd: string, file: string): string {
+	const trimmed = file.trim();
+	if (!trimmed) throw new Error("ledger paths must name a file; got an empty path.");
+	const rel = path.relative(repo.root, path.resolve(cwd, trimmed));
+	if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+		throw new Error(`"${file}" is outside the repository at ${repo.root}; the ledger only keys files inside it.`);
+	}
+	return rel.split(path.sep).join("/");
+}
+
+function renderLedger(files: LedgerFile[]): string {
+	const lines: string[] = [];
+	for (const file of files) {
+		if (file.total === 0) {
+			lines.push(`${file.path} — no notes`, "");
+			continue;
+		}
+		lines.push(`${file.path} — ${file.total} note${file.total === 1 ? "" : "s"}`);
+		const hidden = file.total - file.notes.length;
+		if (hidden > 0) lines.push(`    (${hidden} earlier not shown)`);
+		for (const n of file.notes) {
+			lines.push(`    ${new Date(n.at).toISOString().slice(0, 10)}  ${n.session.slice(0, 8)}  ${n.note}`);
+		}
+		lines.push("");
+	}
+	lines.push("A note records how a past session touched the file. The file in front of you outranks it.");
+	return lines.join("\n");
+}
+
 // ── Result formatting ────────────────────────────────────────────────
 
 interface SurfaceResult {
@@ -994,10 +1135,11 @@ interface MutationReport {
 	created: Array<{ id: string; text: string }>;
 	edited: string[];
 	deleted: string[];
+	annotated: Array<{ path: string; note: string }>;
 	votes: Array<{ id: string; delta: number; missing: boolean }>;
 }
 
-const emptyReport = (): MutationReport => ({ created: [], edited: [], deleted: [], votes: [] });
+const emptyReport = (): MutationReport => ({ created: [], edited: [], deleted: [], annotated: [], votes: [] });
 
 function renderMutations(report: MutationReport): string {
 	const lines: string[] = [];
@@ -1006,6 +1148,7 @@ function renderMutations(report: MutationReport): string {
 	}
 	if (report.edited.length) lines.push(`edited:   ${report.edited.join(", ")}`);
 	if (report.deleted.length) lines.push(`deleted:  ${report.deleted.join(", ")}`);
+	if (report.annotated.length) lines.push(`annotated: ${report.annotated.map((a) => a.path).join(", ")}`);
 	if (report.votes.length) {
 		lines.push(
 			`helpful:  ${report.votes.map((v) => `${v.id} ${v.delta > 0 ? "▲" : "▼"} ${v.delta > 0 ? "+" : ""}${v.delta}`).join(", ")}`,
@@ -1028,7 +1171,8 @@ const PARAMS = Type.Object({
 			'"surface" retrieves memories matching a distill of the current work; it takes `query` and nothing ' +
 			"else. \"checkpoint\" returns the recording instructions for the task you just completed; it takes " +
 			"no argument. \"mutate\" applies the mutation arrays — every array you supply, in the order delete, " +
-			"edit, create, helpful; delete first, so never delete and edit the same id in one call. An argument " +
+			"edit, create, annotate, helpful; delete first, so never delete and edit the same id in one call. " +
+			'"ledger" takes `paths` and returns the per-file notes for each. An argument ' +
 			"that does not belong to the named action is rejected — never silently ignored, never silently " +
 			"applied. " +
 			"Ids are the full ids `surface` returned; a prefix or unknown id is an error.",
@@ -1064,6 +1208,21 @@ const PARAMS = Type.Object({
 				"Where a surfaced id already carries the fact, `edit` it rather than `create` a variant.",
 		}),
 	),
+	paths: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				'Required for action "ledger". File paths relative to the working directory; returns the notes earlier ' +
+				"sessions left on each file, oldest first.",
+		}),
+	),
+	annotate: Type.Optional(
+		Type.Array(Type.Object({ path: Type.String(), note: Type.String() }), {
+			description:
+				"One entry per file edited or written: the path relative to the working directory, and one short " +
+				`sentence (at most ${NOTE_MAX} characters) on how this work touched it. Appended to that file's ` +
+				"ledger, never embedded, never surfaced by similarity.",
+		}),
+	),
 	delete: Type.Optional(Type.Array(Type.String(), { description: "Full ids of memories to remove permanently." })),
 	helpful: Type.Optional(
 		Type.Array(Type.Object({ id: Type.String(), helpful: Type.Boolean() }), {
@@ -1081,12 +1240,15 @@ const DESCRIPTION = [
 	'	"surface" takes `query` — a distill of the work, shaped as the parameter description specifies — and returns',
 	"	what no readable text supplies.",
 	'	"checkpoint" takes nothing and returns the recording instructions for one completed task — not for the session.',
-	'	"mutate" takes the mutation arrays (delete, edit, create, helpful) and applies them in that order.',
+	'	"mutate" takes the mutation arrays (delete, edit, create, annotate, helpful) and applies them in that order.',
+	'	"ledger" takes `paths` relative to the working directory and returns the one-line notes earlier sessions',
+	"	left on each file.",
 ].join("\n");
 
 interface ToolDetails {
 	action: string;
 	hits?: SurfaceHit[];
+	ledger?: LedgerFile[];
 	report: MutationReport;
 }
 
@@ -1121,24 +1283,41 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 	const openStore = (): MemoryStore => openStores().local;
 
+	/** Two git calls per working directory per session, not per note. */
+	const repos = new Map<string, Repo>();
+	const repoFor = (cwd: string): Repo => {
+		let repo = repos.get(cwd);
+		if (!repo) {
+			repo = resolveRepo(cwd);
+			repos.set(cwd, repo);
+		}
+		return repo;
+	};
+
 	/**
 	 * Applies every mutation array present, in a fixed order, to the local store — the global one is
 	 * not writable. Called only from the `mutate` branch: `action` dispatches strictly, so an array can
-	 * only ever be applied by a call that named `mutate`. The order is delete, edit, create, helpful
-	 * so a call can never half-apply a delete-and-edit of the same id.
+	 * only ever be applied by a call that named `mutate`. The order is delete, edit, create, annotate,
+	 * helpful so a call can never half-apply a delete-and-edit of the same id.
 	 */
 	async function applyMutations(
 		params: {
 			delete?: string[];
 			edit?: Array<{ id: string; text: string }>;
 			create?: string[];
+			annotate?: Array<{ path: string; note: string }>;
 			helpful?: Array<{ id: string; helpful: boolean }>;
 		},
 		sessionId: string,
+		cwd: string,
 		signal?: AbortSignal,
 	): Promise<MutationReport> {
 		const hasAny =
-			params.delete?.length || params.edit?.length || params.create?.length || params.helpful?.length;
+			params.delete?.length ||
+			params.edit?.length ||
+			params.create?.length ||
+			params.annotate?.length ||
+			params.helpful?.length;
 		if (!hasAny) return emptyReport();
 
 		const db = openStore();
@@ -1146,6 +1325,11 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		if (params.delete?.length) report.deleted = db.delete(params.delete);
 		if (params.edit?.length) report.edited = await db.edit(params.edit, sessionId, signal);
 		if (params.create?.length) report.created = await db.create(params.create, sessionId, signal);
+		if (params.annotate?.length) {
+			const repo = repoFor(cwd);
+			const items = params.annotate.map((a) => ({ path: ledgerPath(repo, cwd, a.path), note: a.note }));
+			report.annotated = db.annotate(repo.key, items, sessionId);
+		}
 		if (params.helpful?.length) report.votes = db.vote(params.helpful);
 		return report;
 	}
@@ -1176,7 +1360,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			// execute runs — so this gate is what actually holds. A call with no action names nothing.
 			const action = params.action as Action | undefined;
 			if (!action) {
-				throw new Error("durable_memory requires `action` — one of surface, checkpoint, mutate. " +
+				throw new Error("durable_memory requires `action` — one of surface, checkpoint, mutate, ledger. " +
 					"Arguments select nothing on their own.");
 			}
 
@@ -1184,8 +1368,15 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			// and never applied. This is the boundary that keeps a reply-only call (checkpoint) from
 			// silently carrying writes, and keeps a search (surface) from silently carrying ratings.
 			const mutationCount =
-				(params.delete?.length ?? 0) + (params.edit?.length ?? 0) +
-				(params.create?.length ?? 0) + (params.helpful?.length ?? 0);
+				(params.delete?.length ?? 0) + (params.edit?.length ?? 0) + (params.create?.length ?? 0) +
+				(params.annotate?.length ?? 0) + (params.helpful?.length ?? 0);
+			if (action !== "ledger" && params.paths !== undefined) {
+				throw new Error(`action "${action}" does not take \`paths\` — a file's notes are read with action "ledger".`);
+			}
+			if (action === "ledger" && (mutationCount > 0 || params.query)) {
+				throw new Error('action "ledger" takes only `paths`. Notes are written with `annotate` under action ' +
+					'"mutate"; a distill goes with action "surface".');
+			}
 			if (action === "surface" && mutationCount > 0) {
 				throw new Error('action "surface" takes only `query` — mutation arrays are rejected here. ' +
 					'Resend them with action "mutate".');
@@ -1208,16 +1399,25 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				return toolResult("surface", emptyReport(), renderSurface(merged), { hits: merged.hits });
 			}
 
+			if (action === "ledger") {
+				const wanted = (params.paths ?? []).filter((p) => p.trim());
+				if (!wanted.length) throw new Error('action "ledger" requires `paths`: file paths relative to the working directory.');
+				const repo = repoFor(ctx.cwd);
+				const db = openStore();
+				const files = wanted.map((p) => db.ledger(repo.key, ledgerPath(repo, ctx.cwd, p)));
+				return toolResult("ledger", emptyReport(), renderLedger(files), { ledger: files });
+			}
+
 			if (mutationCount === 0) {
 				throw new Error('action "mutate" applied nothing — supply at least one well-formed mutation array ' +
-					"(delete, edit, create, helpful).");
+					"(delete, edit, create, annotate, helpful).");
 			}
-			const report = await applyMutations(params, sessionId, signal);
+			const report = await applyMutations(params, sessionId, ctx.cwd, signal);
 			// The pre-gate counts arrays; this one counts effects — a create of only whitespace has
 			// nothing to show for its arrays, and a silent empty report is worse than an error.
 			if (!Object.values(report).some((a) => a.length > 0)) {
 				throw new Error('action "mutate" applied nothing — supply at least one well-formed mutation array ' +
-					"(delete, edit, create, helpful).");
+					"(delete, edit, create, annotate, helpful).");
 			}
 			const dbg = log();
 			if (dbg && report.votes.length) dbg.logVotes(sessionId, report.votes);
@@ -1233,6 +1433,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 			const { local, global } = openStores();
 			const lines = [
 				`memories:  ${local.count()}${global ? ` local + ${global.count()} global` : ""}`,
+				`ledger:    ${local.annotationCount()} file note${local.annotationCount() === 1 ? "" : "s"}`,
 				`store:     ${local.dir}`,
 			];
 			if (global) lines.push(`global:    ${global.dir} (read-only)`);
@@ -1392,6 +1593,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
 		announceReleaseNotes(ctx);
 		surfaceCalls = 0;
+		repos.clear();
 		closeStores();
 	});
 

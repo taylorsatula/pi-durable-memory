@@ -12,6 +12,7 @@
  *
  * Usage: node bench/probe.mjs
  */
+import { execFileSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -139,8 +140,8 @@ const guides = (tool.promptGuidelines ?? []).join("\n");
 check("guideline makes the surface trigger transcript-checkable", /have not yet called/i.test(guides) && /Check your own transcript/i.test(guides) && /action: "surface"/.test(guides), guides);
 check("guideline makes the checkpoint trigger transcript-checkable", /Check your transcript for a `checkpoint` call after that task or commit/i.test(guides), guides);
 const actionEnum = tool.parameters.properties.action.enum;
-check("the action enum is exactly surface, checkpoint, mutate",
-	JSON.stringify(actionEnum) === JSON.stringify(["surface", "checkpoint", "mutate"]),
+check("the action enum is exactly surface, checkpoint, mutate, ledger",
+	JSON.stringify(actionEnum) === JSON.stringify(["surface", "checkpoint", "mutate", "ledger"]),
 	JSON.stringify(actionEnum));
 check("the dispatch parameter is named action, not op", tool.parameters.properties.action !== undefined && tool.parameters.properties.op === undefined, JSON.stringify(Object.keys(tool.parameters.properties)));
 check("the schema marks action required", (tool.parameters.required ?? []).includes("action"), JSON.stringify(tool.parameters.required));
@@ -157,7 +158,7 @@ check("names the delete-before-edit trap where it states the order", /delete fir
 // repetition is load-bearing; inside the permanent layer it is waste.
 check("the guidelines own the surface trigger", /call it before your first edit/i.test(guides), guides);
 check("the description owns the api and leaves the trigger alone", !/before your first edit/i.test(tool.description) && /`action` selects what a call does/.test(tool.description), tool.description);
-check("the description names all three actions and none of the dead op names", ["surface", "checkpoint", "mutate"].every((o) => tool.description.includes(o)) && !/create, edit, delete, helpful/.test(tool.description.replace(/delete, edit, create, helpful/, "")), tool.description);
+check("the description names all four actions and none of the dead op names", ["surface", "checkpoint", "mutate", "ledger"].every((o) => tool.description.includes(o)) && !/create, edit, delete, helpful/.test(tool.description.replace(/delete, edit, create, helpful/, "")), tool.description);
 
 await fire("session_start");
 
@@ -486,6 +487,105 @@ check("a batch delete naming one unknown id throws", /no memory with id "fffffff
 check("and deleted nothing on the way out", n2 === n1 + 1, `${n1} -> ${n2}`);
 await mutate({ delete: [keeperId] });
 
+// ── 7b. per-file ledger ──────────────────────────────────────────────
+section("[7b] the per-file ledger is keyed by repository and path, never embedded");
+// Two scratch repositories with distinct root commits, so the same relative path names two files.
+const makeRepo = (name) => {
+	const dir = path.join(SCRATCH, name);
+	fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+	const run = (...args) => execFileSync("git", ["-c", "user.name=probe", "-c", "user.email=probe@example.invalid", ...args], { cwd: dir, stdio: "ignore" });
+	run("init", "-q");
+	run("commit", "-q", "--allow-empty", "-m", `root of ${name}`);
+	return dir;
+};
+const REPO_A = makeRepo("repo-a");
+const REPO_B = makeRepo("repo-b");
+const inRepo = (cwd) => (params) => tool.execute("call-ledger", params, undefined, undefined, { ...ctx, cwd });
+const callA = inRepo(REPO_A);
+const callB = inRepo(REPO_B);
+const ledgerRows = () => {
+	const handle = new DatabaseSync(DB, { readOnly: true });
+	try {
+		return handle.prepare("SELECT repo, path, body, session FROM annotations ORDER BY id").all();
+	} finally {
+		handle.close();
+	}
+};
+
+check("the checkpoint message asks for one note per file touched", /`annotate` — one `\{path, note\}` per file you edited or wrote/.test(flat), flat);
+check("the checkpoint message states the order with annotate in it", /delete, edit, create, annotate, helpful/.test(flat));
+
+const annotated = await callA({ action: "mutate", annotate: [{ path: "src/pager.ts", note: "Fixed the cursor off-by-one introduced in a3f9c21." }] });
+check("annotate applies under mutate", annotated.details.report.annotated.length === 1 && /annotated: src\/pager\.ts/.test(textOf(annotated)), textOf(annotated));
+await callA({ action: "mutate", annotate: [{ path: "./src/pager.ts", note: "Touched as part of feature wwvk." }] });
+check("./ and bare relative paths key the same file", ledgerRows().length === 2 && new Set(ledgerRows().map((r) => r.path)).size === 1 && ledgerRows()[0].path === "src/pager.ts", JSON.stringify(ledgerRows().map((r) => r.path)));
+check("the repository key is the root commit", /^git:[0-9a-f]{40}$/.test(ledgerRows()[0].repo), ledgerRows()[0].repo);
+check("the note is stamped with the writing session", ledgerRows()[0].session === SESSION);
+check("the note body follows the store's encryption mode", !/cursor off-by-one/.test(Buffer.from(ledgerRows()[0].body).toString("latin1")));
+
+const readA = await callA({ action: "ledger", paths: ["src/pager.ts"] });
+const readAText = textOf(readA);
+check("ledger returns the file's notes oldest first", readAText.indexOf("off-by-one") > -1 && readAText.indexOf("off-by-one") < readAText.indexOf("feature wwvk"), readAText);
+check("each line carries a date and the session prefix", new RegExp(`\\d{4}-\\d{2}-\\d{2}  ${SESSION.slice(0, 8)}  Fixed`).test(readAText), readAText);
+check("details expose the ledger for renderers", readA.details.ledger?.[0]?.total === 2 && readA.details.action === "ledger");
+
+const fromSubdir = await inRepo(path.join(REPO_A, "src"))({ action: "ledger", paths: ["pager.ts"] });
+check("a path relative to a subdirectory resolves to the same file", fromSubdir.details.ledger?.[0]?.path === "src/pager.ts" && fromSubdir.details.ledger[0].total === 2, JSON.stringify(fromSubdir.details.ledger));
+
+const readB = await callB({ action: "ledger", paths: ["src/pager.ts"] });
+check("the same relative path in another repository has its own ledger", readB.details.ledger?.[0]?.total === 0 && /no notes/.test(textOf(readB)), textOf(readB));
+
+const several = await callA({ action: "ledger", paths: ["src/pager.ts", "src/other.ts"] });
+check("ledger takes several paths in one call", several.details.ledger?.length === 2 && several.details.ledger[1].total === 0);
+
+for (let i = 0; i < 22; i++) await callA({ action: "mutate", annotate: [{ path: "src/hot.ts", note: `Pass ${i} over the hot file.` }] });
+const hot = await callA({ action: "ledger", paths: ["src/hot.ts"] });
+check("a busy file shows its newest 20 notes and counts the rest", hot.details.ledger[0].notes.length === 20 && /2 earlier not shown/.test(textOf(hot)) && /Pass 21 /.test(textOf(hot)) && !/Pass 1 /.test(textOf(hot)), textOf(hot).slice(0, 300));
+
+const rejects = async (params, pattern, name) => {
+	let msg = "";
+	try {
+		await callA(params);
+	} catch (e) {
+		msg = e.message;
+	}
+	check(name, pattern.test(msg), msg || "no error");
+};
+const countBefore = ledgerRows().length;
+await rejects({ action: "ledger" }, /requires `paths`/, "ledger without paths is rejected");
+await rejects({ action: "ledger", paths: ["src/pager.ts"], annotate: [{ path: "src/pager.ts", note: "Stray." }] }, /takes only `paths`/, "ledger carrying a note is rejected, not applied");
+await rejects({ action: "ledger", paths: ["src/pager.ts"], query: "a distill" }, /takes only `paths`/, "ledger carrying a query is rejected");
+await rejects({ action: "checkpoint", annotate: [{ path: "src/pager.ts", note: "Stray." }] }, /takes no argument/, "checkpoint carrying a note is rejected, not applied");
+await rejects({ action: "surface", query: "a distill", annotate: [{ path: "src/pager.ts", note: "Stray." }] }, /mutation arrays are rejected/, "surface carrying a note is rejected, not applied");
+await rejects({ action: "surface", query: "a distill", paths: ["src/pager.ts"] }, /does not take `paths`/, "paths outside ledger are rejected");
+await rejects({ action: "mutate", annotate: [{ path: "../escape.ts", note: "Outside." }] }, /outside the repository/, "a path outside the repository is rejected");
+await rejects({ action: "mutate", annotate: [{ path: "src/a.ts", note: "x".repeat(201) }] }, /at most 200 characters/, "a note longer than one short sentence is rejected");
+await rejects({ action: "mutate", annotate: [{ path: "src/a.ts", note: "Fine." }, { path: "src/b.ts", note: "two\nlines" }] }, /one line/, "a multi-line note is rejected");
+check("no rejected call writes a note", ledgerRows().length === countBefore, `${countBefore} -> ${ledgerRows().length}`);
+
+// A store switched between modes rewrites ledger bodies with its memories, so neither is stranded.
+{
+	const dir = path.join(SCRATCH, "ledger-switch");
+	const store = new MemoryStore(dir);
+	store.annotate("git:probe", [{ path: "src/x.ts", note: "Plaintext ledger note." }], SESSION);
+	const body = () => {
+		const handle = new DatabaseSync(path.join(dir, "memory.db"), { readOnly: true });
+		try {
+			return Buffer.from(handle.prepare("SELECT body FROM annotations").get().body).toString("latin1");
+		} finally {
+			handle.close();
+		}
+	};
+	check("an unencrypted store keeps the note in the clear", body() === "Plaintext ledger note.");
+	store.switchEncryption(true);
+	check("switching on encrypts ledger bodies", !/Plaintext/.test(body()));
+	check("and the note still reads back", store.ledger("git:probe", "src/x.ts").notes[0]?.note === "Plaintext ledger note.");
+	store.switchEncryption(false);
+	check("switching off restores the plaintext", body() === "Plaintext ledger note.");
+	check("the status count reads the ledger", store.annotationCount() === 1);
+	store.close();
+}
+
 // ── 8. failure paths propagate ───────────────────────────────────────
 section("[8] failure paths propagate instead of returning empty");
 const throws = async (params, pattern) => {
@@ -545,6 +645,7 @@ check("status reports the endpoint and model", /endpoint:.*emb-qwen3/.test(statu
 check("status reports the auth-key source", /auth key:\s+\S/.test(status), status);
 check("status reports the active session", status.includes(SESSION), status);
 check("status reports the surface-call count", /\d+ surface call/.test(status), status);
+check("status reports the ledger count", /ledger:\s+\d+ file note/.test(status), status);
 
 await fire("session_shutdown");
 await fire("session_shutdown");
