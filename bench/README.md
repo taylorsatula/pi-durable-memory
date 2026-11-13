@@ -17,16 +17,23 @@ measurements, not guesses, and this directory is how they get re-measured.
 ## Running
 
 ```bash
-node bench/probe.mjs     # functional witness; exits non-zero on any failure
-node bench/run.mjs       # tuning sweep; add --no-cache to re-embed from scratch
+node bench/probe.mjs                # functional witness; exits non-zero on any failure
+node bench/probe.mjs --with-corpus  # also the retrieval accuracy section; fails without a corpus
+node bench/run.mjs                  # tuning sweep; add --no-cache to re-embed from scratch
 ```
+
+The retrieval section needs `corpus.json`, which is harvested from one operator's session history and
+gitignored, so a clone cannot have it. It runs only under `--with-corpus`, the run that re-measures
+`MIN_COSINE` and `TOP_K` after an embedding-model change. Everything else runs unconditionally, and a
+skipped section is printed with the number of assertions it did not run rather than swallowed. The
+`prepublishOnly` gate is the default run, so publishing does not depend on having a corpus.
 
 Both need a `lunaroute` credential — in `~/.pi/agent/durable-memory/config.json`, or
 `~/.pi/agent/auth.json`, or `DURABLE_MEMORY_EMBED_KEY`. `probe.mjs` also needs `PI_NODE_MODULES` if it cannot find a pi
 install under `~/.pi/agent/install/releases`.
 
-`probe.mjs` skips its retrieval section with a visible failure if `corpus.json` is absent, so
-a fresh clone still exercises everything else.
+`probe.mjs` prints the skipped retrieval section, with its assertion count, when `corpus.json` is
+absent, so a fresh clone still exercises everything else and the gap is visible.
 
 ## Building a corpus
 
