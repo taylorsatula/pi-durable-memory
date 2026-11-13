@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 
 import type {
 	AgentToolResult,
@@ -274,34 +275,35 @@ function rule(width = 5): string {
  */
 const RELEASE_NOTES: Record<string, string> = {
 	"0.5.0": [
-		"The create directive was rewritten from linguistic categories into checkable forms.",
+		"The instructions that decide what your agent saves were rewritten, and there is now a way to clean",
+		"up what is already saved.",
 		"",
-		"Directive v2 asked for a gnomic-present stative proposition, endophorically complete, rigidly",
-		"designated, paratactically extended. Those are categories of text, and a model cannot inspect",
-		"its own draft against a category while it is generating that draft. Measured over a 383-row",
-		"corpus written under v2, the rules failed: median 61 words against the single sentence the",
-		"directive demanded, 45 percent carrying a relative clause and 36 percent a subordinating",
-		"conjunction against the parataxis rule, 61 percent carrying a quantified generic, and 17",
-		"percent carrying the verification condition the directive called obligatory.",
+		"The old instructions described a good memory in linguistic terms: one sentence, stated as a present",
+		"fact, no vague references, no \"every\" or \"always\". Those are hard to follow while writing, and a",
+		"real store of 383 memories showed it. Rows ran two to three times longer than the one sentence that",
+		"was asked for, most carried no way to tell whether they had gone stale, and many said \"every\" or",
+		"\"all\" where naming the actual items would have been more use later.",
 		"",
-		"The cause is arithmetic. v2 required four payloads inside one clause: the theme, the",
-		"assertion, its context, and the check. One clause holds one assertion, so the surplus went",
-		"into coordination and subordination and the rows grew to fit. What the corpus did imitate is",
-		"the shape of v2's single worked example, which carries no verification clause: 83 percent of",
-		"the corpus carries none either, against the rule that made one obligatory.",
+		"The cause was the instructions rather than the agent. They asked for four things inside one",
+		"sentence: where the memory applies, the fact itself, its context, and the check that would show it",
+		"is stale. One sentence does not hold four things, so the rest spilled over and the rows grew.",
 		"",
-		"Directive v3 states each rule as a form an author can check in their own draft: one question",
-		"per row, a rigid designator in the first eight words, enumerate instead of quantify, no",
-		"deixis, and the check as a second sentence opening `Verify stale by:`. It carries four worked",
-		"examples, one per kind the store holds, and one negative example. It also admits two things",
-		"v2 forbade without saying so: a repo snapshot whose commit is named in the row, and an event",
-		"whose numbers cannot be reproduced later.",
+		"The new instructions ask for the same things as forms you can check in your own writing: one",
+		"question per memory, a file path or host or version in the first few words, name the items instead",
+		"of saying \"every\", and put the staleness check in a second sentence starting \"Verify stale by:\".",
+		"They also carry four complete examples, one for each kind of memory worth keeping, and one example",
+		"of the shape to avoid. Examples are what an agent actually imitates, so there are more of them.",
 		"",
-		"The rule text is single-sourced between the checkpoint message and the `create` parameter",
-		"description, so the two cannot drift. The store records `directive` in its meta table on first",
-		"write, so a future pass can tell which rows predate v3.",
+		"Two things the old instructions banned outright are now allowed with a condition, because memories",
+		"kept getting written that way regardless: a fact read out of a repository, if the memory names the",
+		"commit it was read from; and something that happened, if its numbers cannot be reproduced later.",
 		"",
-		"Existing rows are not rewritten by this release. Re-passing them is a deliberate act.",
+		"Your existing memories are not changed by this update. If your store still holds memories written",
+		"under the old instructions, a line at the end of every memory search says how many, and the",
+		"/durable-memory menu has a row for it. Cleaning them up is a job for your agent rather than",
+		"something you do by hand: it reads the whole store, rewrites each memory into the new shape, and",
+		"is blocked from saving any rewrite that drops a file path, a version, or a measured figure. Ask",
+		"your agent to run a refinement pass when you want one. It backs the store up first.",
 	].join("\n"),
 	"0.4.1": [
 		"The memory prompt has been significantly improved — and it will be iteratively improved more over time.",
@@ -568,8 +570,11 @@ export class MemoryStore {
 			`);
 			migrateLegacyStore(this.db, dir); // LEGACY MIGRATION — remove with its section
 			// Recorded once, so a later pass can tell which rows were written under an older directive.
+			// The row count at that moment is the legacy set: every one of them predates this version,
+			// and a refinement pass clears the mark rather than recounting it.
 			if (!this.one("SELECT v FROM meta WHERE k = 'directive'")) {
 				this.setMeta("directive", String(DIRECTIVE_VERSION));
+				this.setMeta("legacy_rows", String(this.count()));
 			}
 		}
 
@@ -615,6 +620,11 @@ export class MemoryStore {
 
 	count(): number {
 		return Number(this.one<{ n: number | bigint }>("SELECT COUNT(*) AS n FROM memories")?.n ?? 0);
+	}
+
+	/** Rows stored when this store first recorded a directive version, so all of them predate it. Zero once a refinement pass clears the mark. */
+	legacyRows(): number {
+		return Number(this.one<{ v: string }>("SELECT v FROM meta WHERE k = 'legacy_rows'")?.v ?? 0);
 	}
 
 	/**
@@ -912,7 +922,7 @@ async function searchStores(stores: Stores, query: string, signal?: AbortSignal)
 	};
 }
 
-function renderSurface(result: MergedSurface): string {
+function renderSurface(result: MergedSurface, byline = ""): string {
 	const lines: string[] = result.skipped.map((s) => `The ${s.name} store was skipped: ${s.error}`);
 	if (lines.length) lines.push("");
 
@@ -937,6 +947,7 @@ function renderSurface(result: MergedSurface): string {
 		lines.push("");
 		lines.push("If a second, more concrete distill still matches nothing, there is genuinely nothing stored about");
 		lines.push("this work. Proceed, and at the checkpoint `create` the memories this session is producing.");
+		if (byline) lines.push(byline);
 		lines.push(checkpointReminder());
 		return lines.join("\n");
 	}
@@ -958,8 +969,50 @@ function renderSurface(result: MergedSurface): string {
 	lines.push("");
 	lines.push("If these do not cover the work, surface again with a distill naming different machinery.");
 	lines.push("Surface again too when you move to a new subsystem, even if these matched.");
+	if (byline) lines.push(byline);
 	lines.push(checkpointReminder());
 	return lines.join("\n");
+}
+
+/** The refinement runbook. Ships beside this file, so an installed package can name an absolute path. */
+const REFINEMENT_DOC_PATH = fileURLToPath(new URL("./docs/refinement-pass.md", import.meta.url));
+
+/** The settings-picker row. Plain wording: this label is read by the operator, not by a model. */
+function refineRowLabel(db: MemoryStore): string {
+	const n = db.legacyRows();
+	return n > 0
+		? `Refine          ${n} memories predate the current writing rules`
+		: "Refine          every memory follows the current writing rules";
+}
+
+/** What the picker and the status screen print. Points at the runbook; never starts a pass. */
+function refinementInstructions(db: MemoryStore): string {
+	const n = db.legacyRows();
+	return n > 0
+		? `${n} of your memories were written before the current rules for writing them, so they are longer and vaguer than they need to be. Ask your agent to run a refinement pass; the procedure it follows is ${REFINEMENT_DOC_PATH}`
+		: `Every memory follows the current writing rules. The refinement procedure, for a pass you want anyway, is ${REFINEMENT_DOC_PATH}`;
+}
+
+/**
+ * Appended to a `surface` render while the store still holds rows written before the current create
+ * directive. It names the antipatterns to look for in the hits the agent is already holding, so the
+ * judgement costs no extra read, and it points at the runbook instead of restating it. Offers the
+ * pass; it never starts one, because the pass rewrites stored rows and that is the user's call.
+ */
+function refinementByline(db: MemoryStore): string {
+	const n = db.legacyRows();
+	if (n <= 0) return "";
+	return [
+		"",
+		rule(30),
+		`${MARK} ${n} of the stored memories were written before the current rules for writing them.`,
+		`${MARK} In the hits above, look for: several mechanisms in one row; an opening that is not a path,`,
+		`${MARK} host, or proper name; "every" or "all" where naming the items belongs; no \`Verify stale by:\``,
+		`${MARK} clause. Those rows retrieve worse than the same facts split into atomic rows. If the hits show`,
+		`${MARK} them, offer the user a one-time refinement pass and run it only on their go-ahead. Procedure:`,
+		`${MARK}   ${REFINEMENT_DOC_PATH}`,
+		rule(30),
+	].join("\n");
 }
 
 /**
@@ -1165,7 +1218,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				const merged = await searchStores(openStores(), query, signal);
 				surfaceCalls++;
 
-				const lines = [renderSurface(merged)];
+				const lines = [renderSurface(merged, refinementByline(openStore()))];
 				if (hasMutations(report)) lines.push("", "Applied in the same call:", renderMutations(report));
 				return toolResult("surface", report, lines.join("\n"), { hits: merged.hits });
 			}
@@ -1193,6 +1246,7 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 				`encrypted: ${local.encrypted ? "yes" : "no"} (local store)`,
 				`session:   ${ctx.sessionManager.getSessionId()}`,
 				`this session: ${surfaceCalls} surface call${surfaceCalls === 1 ? "" : "s"}`,
+				refinementInstructions(local),
 			);
 			return lines.join("\n");
 		} catch (err) {
@@ -1205,13 +1259,14 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 		for (;;) {
 			const s = readSettings();
 			const r = resolveSettings();
-			const rows: Array<[Key | "status" | "done" | "encrypt", string]> = [
+			const rows: Array<[Key | "status" | "done" | "encrypt" | "refine", string]> = [
 				["endpoint", `Endpoint        ${r.endpoint}`],
 				["url", `URL             ${r.url}${r.urlOverridden ? " (overridden)" : ""}`],
 				["model", `Embedding model ${r.model}`],
 				["apiKey", `Auth key        ${r.apiKey ? `set (…${r.apiKey.slice(-4)})` : "not set"}`],
 				["storeDir", `Database dir    ${r.storeDir}`],
 				["encrypt", `Encryption      ${openStore().encrypted ? "encrypted" : "unencrypted"} (local)`],
+				["refine", refineRowLabel(openStore())],
 				["status", "Show status"],
 				["done", "Done"],
 			];
@@ -1231,6 +1286,13 @@ export default function durableMemoryExtension(pi: ExtensionAPI) {
 
 			if (key === "status") {
 				ctx.ui.notify(statusText(ctx), "info");
+				continue;
+			}
+
+			if (key === "refine") {
+				// The picker names the runbook; the agent runs it. A pass rewrites stored rows, so it
+				// starts from a user instruction rather than from a settings row.
+				ctx.ui.notify(refinementInstructions(openStore()), "info");
 				continue;
 			}
 

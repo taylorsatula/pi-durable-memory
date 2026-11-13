@@ -51,6 +51,18 @@ while each person still writes privately to their local store. Mounting one, see
 what happens when its vectors were built with a different embedding model are covered in
 [docs/global-store.md](docs/global-store.md).
 
+## Refining an existing store
+
+Rows written before the current create directive follow older rules, and they retrieve worse for it:
+several mechanisms in one row, an opening that is not a path or a proper name, a quantifier where an
+enumeration belongs, no staleness check. While a store holds such rows, `surface` ends with a byline
+naming the count and pointing at the runbook, and `/durable-memory` carries a row for it.
+
+The pass is run by an agent, not by hand: it reads the whole store, classifies every row, and rewrites
+it behind a coverage gate that rejects any edit dropping a path, a commit sha, a version, or a
+measured number. Ask your agent to run a refinement pass; the procedure and the two scripts it drives
+are in [docs/refinement-pass.md](docs/refinement-pass.md).
+
 ## Verification
 
 The probe and the retrieval benchmark live in the repository, not in the published package:
