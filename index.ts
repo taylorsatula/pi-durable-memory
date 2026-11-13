@@ -167,6 +167,64 @@ const SCORE_INFLUENCE_CAP = 0.25;
 const OPS = ["surface", "checkpoint", "create", "edit", "delete", "helpful"] as const;
 type Op = (typeof OPS)[number];
 
+/** Bumped on every change to CREATE_RULES. */
+const DIRECTIVE_VERSION = 3;
+
+/**
+ * The create contract. Single-sourced: CHECKPOINT_MESSAGE item 1 and the `create` parameter
+ * description both interpolate these lines, so the two cannot drift. A rule written out twice in
+ * two places is how the v2 directive and its own corpora came to disagree.
+ *
+ * Every rule names a form an author can check in their own draft, not a category of text. That is
+ * the whole change from directive v2 (shipped 0.4.0), and the reason for it is measured: v2 stated
+ * its rules as linguistic categories (gnomic-present, endophoric, paratactic, perfective), and a
+ * model generating a draft cannot inspect that draft against a category. Measured over a 383-row
+ * corpus written under v2, the median row ran 61 words against the one sentence v2 demanded, 45
+ * percent carried a relative clause and 36 percent a subordinating conjunction against its
+ * parataxis rule, 61 percent carried a quantified generic, and 17 percent carried the verification
+ * condition v2 called obligatory. The cause is arithmetic rather than care: v2 required four
+ * payloads in one clause, the theme, the assertion, its context and the check, so the surplus went
+ * into coordination and subordination and the rows grew to fit. What the corpus did imitate is
+ * the shape of v2's single worked example, which carries no verification clause: 83 percent of
+ * the corpus carries none either, against the rule that made one obligatory.
+ */
+const CREATE_RULES: string[] = [
+	'One row answers one question. Name that question before writing the row; if naming it needs "and", write two rows.',
+	"One declarative sentence, then optionally one check sentence opening exactly `Verify stale by:`.",
+	"A rigid designator in the first eight words: a path, host, instance id, commit sha, version, or proper name. A row is retrieved by what it opens on.",
+	"No deixis and no session voice: not this, that, these, those, today, the above, we, our. The row is read cold, after the session that wrote it is gone.",
+	'Enumerate instead of quantifying: "the two shapes", "the six keys", never "every shape" or "all keys". An enumerated row survives being quoted alone.',
+	"A number comes from measurement, benchmark, requirement, or calculation, or the row stays qualitative. No approximately, roughly, may, probably.",
+	"Only what no readable text supplies. Two kinds qualify: a fact no file states, and a repo snapshot whose commit is named in the row. Repo content with no commit is entailed, and a second copy of it diverges.",
+	'An event is admissible only when its numbers cannot be reproduced later, and then the date is part of the fact: "measured 2026-11-04 over 4.75 h, p50 18,137 tok/s".',
+	"Two tests before recording: WHEN does this next fire, WHAT kills it? Either unanswered — no call.",
+	"The check names a path, string, or command whose change proves the row stale. A row that cannot be falsified is a belief, and beliefs age into wrong instructions.",
+	"Where a surfaced id already carries the fact, `edit` it rather than `create` a second one; a ruling that contradicts an existing row edits that row; never append a duplicate beside it.",
+];
+
+/** The rules as an indented list, for CHECKPOINT_MESSAGE. */
+const CREATE_RULES_BLOCK = CREATE_RULES.map((r) => `   - ${r}`).join("\n");
+
+/** The rules as one paragraph, for the `create` parameter description. */
+const CREATE_RULES_INLINE = CREATE_RULES.join(" ");
+
+/**
+ * One worked example per kind the store actually holds, then the shape that must never be written.
+ * v2 carried a single example and the corpus imitated it, so the examples are the load-bearing
+ * part of this directive and the rules are the gloss above them.
+ */
+const CREATE_EXAMPLES = [
+	"   Host state, recorded nowhere in any repo: Vast instance 52821222 runs lunaroute-scheduler on 0.0.0.0:8191 with no bind-host flag and no authentication; its only protection is that Vast publishes no port mapping for 8191. Verify stale by: `ss -tlnp` on the box showing 8191 on a loopback address.",
+	"",
+	"   Repo snapshot, commit named: At lunaroute-saas commit 615e3552, scripts/ci/check-map-inputs.mjs admits exactly two dependency-clause shapes for a deploy-flow unit job: `needs.X.result == 'success' || needs.X.result == 'skipped'`, and `needs.select.outputs.<unit> != 'true' || needs.<job>.result == 'success'`. Verify stale by: `git show 615e3552:scripts/ci/check-map-inputs.mjs` no longer carrying both branches.",
+	"",
+	"   Measurement, with the conditions it holds under: GLM-5.3 prefill on Vast 52821222 runs at a p50 of 18,137 input tok/s at TP 8 with EAGLE 3/1/4 and 16,384-token chunks, measured 2026-11-04, which puts a 1.4M-token cache miss at about 77 s of exclusive engine time. Verify stale by: /root/kit/env.sh or the serve script's flag set changing.",
+	"",
+	'   Harness behaviour, with its failure and its working form: `git commit -m` truncates a multi-line message at its first double quote and parses the remaining words as pathspecs, failing with "did not match any file(s) known to git" and committing nothing; an apostrophe inside a single-quoted message does the same. Commit text goes through `git commit -F <file>`. Verify stale by: committing a message that holds a quote from a scratch repo and reading back what landed.',
+	"",
+	'   Never this shape: "The scheduler config is hot-reloaded and we confirmed the reload census today, so all the admission knobs can change without a restart." Session voice (we), deictic time (today), a quantified generic (all), no rigid designator, no check.',
+].join("\n");
+
 /**
  * Returned verbatim on every `checkpoint` call. Task-scoped, not session-scoped: a model cannot
  * observe "the session is ending", but it can observe "the task is done".
@@ -176,26 +234,13 @@ const CHECKPOINT_MESSAGE = [
 	"",
 	"You just completed a unit of work. Batch the following into ONE call:",
 	"",
-	"1. `create` — facts no readable text supplies. One self-contained sentence per fact: a",
-	"   gnomic-present stative proposition — what IS, never what happened; events culminate and rot,",
-	"   states hold until refuted, and the aspect is the shelf life.",
+	"1. `create`: facts no readable text supplies, one row per fact.",
 	"",
-	"   Endophorically complete: no deixis, no exophora — the session that wrote it no longer exists",
-	"   at retrieval time. Rigidly designated: paths, error strings, proper nouns, numerals — never",
-	"   hypernyms or quantified generics. Paratactically extended, not subordinated: fact and context",
-	"   as one embedding unit with two retrieval surfaces. The theme names where it fires — the file,",
-	"   command, or decision moment that will need this memory.",
+	CREATE_RULES_BLOCK,
 	"",
-	"   Not entailed by any accessible text: what the repo, docstrings, or this tool's instructions",
-	"   say, they say better, and a second copy diverges. Carry the verification condition — the",
-	"   checkable path, string, or command whose change proves the row stale; an unfalsifiable row",
-	"   is a belief.",
+	"   Four kinds the store holds, one example each:",
 	"",
-	"   The negative, never: a perfective event report — exophoric, deictic, hedged, autological,",
-	"   duplicated, or entailed — culminated work with no next time and no killer. Two tests before",
-	"   recording: WHEN does this next fire, WHAT kills it? Either unanswered — no call. Where a",
-	"   surfaced id already carries the fact, `edit` it rather than `create` a second one; a ruling",
-	"   that contradicts an existing row edits that row; never append a duplicate beside it.",
+	CREATE_EXAMPLES,
 	"",
 	"2. `helpful` — rate every id `surface` showed you and you have not rated: `true` if it changed what",
 	"   you did, `false` if it did not. Ratings decide what surfaces next; guess rather than skip.",
@@ -228,7 +273,37 @@ function rule(width = 5): string {
  * install, then never again for that version.
  */
 const RELEASE_NOTES: Record<string, string> = {
-	"0.4.0": [
+	"0.5.0": [
+		"The create directive was rewritten from linguistic categories into checkable forms.",
+		"",
+		"Directive v2 asked for a gnomic-present stative proposition, endophorically complete, rigidly",
+		"designated, paratactically extended. Those are categories of text, and a model cannot inspect",
+		"its own draft against a category while it is generating that draft. Measured over a 383-row",
+		"corpus written under v2, the rules failed: median 61 words against the single sentence the",
+		"directive demanded, 45 percent carrying a relative clause and 36 percent a subordinating",
+		"conjunction against the parataxis rule, 61 percent carrying a quantified generic, and 17",
+		"percent carrying the verification condition the directive called obligatory.",
+		"",
+		"The cause is arithmetic. v2 required four payloads inside one clause: the theme, the",
+		"assertion, its context, and the check. One clause holds one assertion, so the surplus went",
+		"into coordination and subordination and the rows grew to fit. What the corpus did imitate is",
+		"the shape of v2's single worked example, which carries no verification clause: 83 percent of",
+		"the corpus carries none either, against the rule that made one obligatory.",
+		"",
+		"Directive v3 states each rule as a form an author can check in their own draft: one question",
+		"per row, a rigid designator in the first eight words, enumerate instead of quantify, no",
+		"deixis, and the check as a second sentence opening `Verify stale by:`. It carries four worked",
+		"examples, one per kind the store holds, and one negative example. It also admits two things",
+		"v2 forbade without saying so: a repo snapshot whose commit is named in the row, and an event",
+		"whose numbers cannot be reproduced later.",
+		"",
+		"The rule text is single-sourced between the checkpoint message and the `create` parameter",
+		"description, so the two cannot drift. The store records `directive` in its meta table on first",
+		"write, so a future pass can tell which rows predate v3.",
+		"",
+		"Existing rows are not rewritten by this release. Re-passing them is a deliberate act.",
+	].join("\n"),
+	"0.4.1": [
 		"The memory prompt has been significantly improved — and it will be iteratively improved more over time.",
 		"",
 		"This release rewrites the instructions that guide what the agent saves to memory — the memory",
@@ -492,6 +567,10 @@ export class MemoryStore {
 				CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 			`);
 			migrateLegacyStore(this.db, dir); // LEGACY MIGRATION — remove with its section
+			// Recorded once, so a later pass can tell which rows were written under an older directive.
+			if (!this.one("SELECT v FROM meta WHERE k = 'directive'")) {
+				this.setMeta("directive", String(DIRECTIVE_VERSION));
+			}
 		}
 
 		// Migration records the mode on any pre-0.3.5 store, so this is a plain read. A read-only store
@@ -953,15 +1032,7 @@ const PARAMS = Type.Object({
 	),
 	create: Type.Optional(
 		Type.Array(Type.String(), {
-			description:
-				"Memory texts to store: one gnomic-present stative proposition per fact of what no readable " +
-				"text supplies — endophorically complete (no deixis or exophora; the writing session is gone " +
-				"at retrieval time), rigidly designated (paths, error strings, proper nouns, numerals — never " +
-				"hypernyms), paratactically extended rather than subordinated, opening on the file, command, " +
-				"or decision moment where it fires, and carrying its verification condition — the checkable " +
-				"path, string, or command whose change proves the row stale. " +
-				'Example: ["npm publish fails with 401/ENEEDAUTH — the ~/.npmrc token returns 401 on publish; ' +
-				'the working credential is a bypass token only the user supplies on request."]',
+			description: "Memory texts to store, one fact per row. " + CREATE_RULES_INLINE,
 		}),
 	),
 	edit: Type.Optional(
